@@ -34,20 +34,21 @@ log = logging.getLogger("nba-bot")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 if not TELEGRAM_TOKEN:
     raise RuntimeError("Missing TELEGRAM_TOKEN env var (set it in Railway Variables)")
-   
-POLL_SECONDS = 120
+
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "120"))
+SEASON = os.environ.get("NBA_SEASON", "2025-26")
+
 PROPS_FILE = "props.json"
 ALERTS_STATE_FILE = "alerts_state.json"
 IDS_CACHE_FILE = "player_ids_cache.json"
 GLOG_CACHE_FILE = "gamelog_cache.json"
-
-SEASON = os.environ.get("NBA_SEASON", "2025-26")  # ajusta cuando cambie
+PREGAME_STATE_FILE = "pregame_state.json"
 
 # thresholds / scoring
 FINAL_ALERT_THRESHOLD = 75
 FINAL_ALERT_THRESHOLD_CLUTCH = 68
 
-COOLDOWN_SECONDS = 8 * 60  # anti spam por prop
+COOLDOWN_SECONDS = 8 * 60
 BLOWOUT_IS = 20
 BLOWOUT_STRONG = 22
 
@@ -66,9 +67,8 @@ MARGIN_CAP = {"puntos": 8.0, "rebotes": 3.0, "asistencias": 3.0}
 # Polymarket Gamma API
 GAMMA = "https://gamma-api.polymarket.com"
 
-
 # =========================
-# HTTP sessions (stats.nba.com) robusto
+# HTTP sessions
 # =========================
 NBA_HEADERS = {
     "User-Agent": (
@@ -125,6 +125,9 @@ def save_json(path: str, data):
 def now_ts() -> int:
     return int(time.time())
 
+def clamp(x, lo=0, hi=100):
+    return max(lo, min(hi, x))
+
 
 # =========================
 # Data model
@@ -156,7 +159,7 @@ def save_props(props: List[Prop]):
 # Player ID cache
 # =========================
 def obtener_id_jugador(nombre: str) -> Optional[int]:
-    time.sleep(0.3 + random.random() * 0.2)
+    time.sleep(0.25 + random.random() * 0.2)
     res = players.find_players_by_full_name(nombre)
     if not res:
         return None
@@ -184,7 +187,7 @@ def get_pid_for_name(name: str) -> Optional[int]:
 # =========================
 # Gamelog cache + fetch
 # =========================
-GLOG_TTL_SECONDS = 6 * 60 * 60  # 6h
+GLOG_TTL_SECONDS = 6 * 60 * 60
 
 def load_glog_cache():
     return load_json(GLOG_CACHE_FILE, {})
@@ -200,7 +203,7 @@ def get_gamelog_table(pid: int) -> Tuple[List[str], List[list]]:
     if k in cache and (now - int(cache[k].get("ts", 0))) < GLOG_TTL_SECONDS:
         return cache[k].get("headers", []), cache[k].get("rows", [])
 
-    time.sleep(0.6 + random.random() * 0.4)
+    time.sleep(0.55 + random.random() * 0.45)
 
     url = "https://stats.nba.com/stats/playergamelog"
     params = {
@@ -240,9 +243,6 @@ def get_gamelog_table(pid: int) -> Tuple[List[str], List[list]]:
 # =========================
 # PRE SCORE (forma 5/10) for over/under
 # =========================
-def clamp(x, lo=0, hi=100):
-    return max(lo, min(hi, x))
-
 def stdev(vals: List[float]) -> float:
     if not vals or len(vals) < 2:
         return 0.0
@@ -274,14 +274,14 @@ def hit_counts(values: List[float], line: float, side: str) -> Tuple[int, int]:
         return 0, 0
     if side == "over":
         hits = sum(1 for v in values if v > line)
-    else:  # under
+    else:
         hits = sum(1 for v in values if v < line)
     return hits, len(values)
 
 def margin_values(values: List[float], line: float, side: str) -> List[float]:
     if side == "over":
         return [v - line for v in values]
-    return [line - v for v in values]  # under
+    return [line - v for v in values]
 
 def pre_score(pid: int, tipo: str, line: float, side: str) -> Tuple[int, dict]:
     v5 = last_n_values(pid, tipo, 5)
@@ -315,7 +315,6 @@ def pre_score(pid: int, tipo: str, line: float, side: str) -> Tuple[int, dict]:
     PRE = int(clamp(0.55 * HitScore + 0.25 * MarginScore + 0.20 * ConsistencyScore, 0, 100))
 
     meta = {
-        "hit5": round(hit5, 2), "hit10": round(hit10, 2),
         "hits5": h5, "n5": n5, "hits10": h10, "n10": n10,
         "avg5": round(avg5, 2), "avg10": round(avg10, 2),
         "std10": round(std10, 2), "w_margin": round(w_margin, 2),
@@ -324,7 +323,7 @@ def pre_score(pid: int, tipo: str, line: float, side: str) -> Tuple[int, dict]:
 
 
 # =========================
-# Live helpers (nba_api live)
+# Live helpers
 # =========================
 def parse_minutes(min_str) -> float:
     if not min_str:
@@ -367,17 +366,15 @@ def game_elapsed_minutes(period: int, clock_seconds: Optional[int]) -> Optional[
 
 
 # =========================
-# LIVE SCORE (tu lógica simplificada, compatible)
+# LIVE SCORE
 # =========================
 def should_gate_by_minutes(side: str, tipo: str, value: float, mins: float, elapsed_min, is_blowout: bool) -> bool:
     if side == "over":
-        # gate suave al principio si casi no jugó
         if elapsed_min is not None and elapsed_min >= 18:
             return False
         min_req = MIN_MINUTES_POINTS if tipo == "puntos" else MIN_MINUTES_REB_AST
         return mins < min_req
     else:
-        # under no tiene sentido muy temprano
         if elapsed_min is None:
             return True
         if is_blowout and elapsed_min >= 16:
@@ -385,17 +382,18 @@ def should_gate_by_minutes(side: str, tipo: str, value: float, mins: float, elap
         return elapsed_min < 22
 
 def compute_over_score(tipo, faltante, mins, pf, period, clock_seconds, diff, is_clutch, is_blowout) -> int:
-    # (idéntico espíritu al tuyo; compacto)
     if tipo == "puntos":
         near_max, ideal_max = 4.0, 2.0
         close_weight, ideal_bonus = 60, 10
         min_floor = 10.0
         foul_mult, blow_mult = 1.0, 1.0
+        min_weight = 12.0
     else:
         near_max, ideal_max = 1.5, 0.9
         close_weight, ideal_bonus = 65, 12
         min_floor = 14.0
         foul_mult, blow_mult = 1.25, 1.35
+        min_weight = 12.0
 
     if faltante < 0.5 or faltante > near_max:
         return 0
@@ -418,7 +416,7 @@ def compute_over_score(tipo, faltante, mins, pf, period, clock_seconds, diff, is
     if is_clutch:
         spot += 11
 
-    min_score = clamp((mins - min_floor) / 18 * 12, 0, 12)
+    min_score = clamp((mins - min_floor) / 18 * min_weight, 0, min_weight)
 
     foul_pen = 0
     if pf >= 5: foul_pen = 18
@@ -448,7 +446,6 @@ def compute_under_score(tipo, margin_under, mins, pf, period, clock_seconds, dif
 
     elapsed_min = game_elapsed_minutes(period, clock_seconds) if clock_seconds is not None else None
     time_score = clamp(((elapsed_min or 0) - 20) / 28 * 28, 0, 28)
-
     cushion = clamp((margin_under - min_margin) / (good_margin - min_margin) * 40, 0, 40)
 
     blow = 0
@@ -487,28 +484,132 @@ def can_send_alert(state: dict, key: str) -> bool:
 
 
 # =========================
-# Polymarket odds (Gamma API)
+# Pregame helpers (featured + T-90)
 # =========================
-def polymarket_nba_markets_today(limit: int = 50) -> List[dict]:
-    """
-    Muy pragmático: busca por "NBA" y "@" (matchups) en markets activos.
-    Si quieres más precisión por tags (NBA), lo refinamos.
-    Gamma API: /public-search, /markets, /events. (público)  :contentReference[oaicite:2]{index=2}
-    """
-    q = "NBA"
-    # /public-search retorna mezcla; nos quedamos con markets
-    url = f"{GAMMA}/public-search"
-    params = {"q": q, "limit": str(limit)}
-    r = SESSION_PM.get(url, params=params, timeout=20)
+def load_pregame_state():
+    return load_json(PREGAME_STATE_FILE, {})
+
+def save_pregame_state(st):
+    save_json(PREGAME_STATE_FILE, st)
+
+def parse_game_start_utc(game_obj: dict) -> Optional[datetime]:
+    candidates = [
+        game_obj.get("gameTimeUTC"),
+        game_obj.get("gameTimeUtc"),
+        game_obj.get("gameTimeISO"),
+        game_obj.get("gameTime"),
+        game_obj.get("gameTimeUTCString"),
+    ]
+    for c in candidates:
+        if not c:
+            continue
+        s = str(c)
+        try:
+            if s.endswith("Z"):
+                return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            continue
+    return None
+
+def minutes_to_start(game_obj: dict) -> Optional[float]:
+    start = parse_game_start_utc(game_obj)
+    if not start:
+        return None
+    now = datetime.now(timezone.utc)
+    return (start - now).total_seconds() / 60.0
+
+def mark_once(st: dict, key: str) -> bool:
+    if key in st:
+        return False
+    st[key] = now_ts()
+    return True
+
+
+# =========================
+# Polymarket: universo P/R/A (sin cuotas)
+# =========================
+PAR_LINE_RE = re.compile(
+    r"^(?P<player>.+?)\s+"
+    r"(?P<stat>puntos|rebotes|asistencias|points|rebounds|assists|pts|reb|ast)\b.*?"
+    r"(?:(?:\bO(?:ver)?\s*(?P<o1>\d+(\.\d+)?)\b.*?\bU(?:nder)?\s*(?P<u1>\d+(\.\d+)?)\b)"
+    r"|(?:\bOver\s*(?P<o2>\d+(\.\d+)?)\b.*?\bUnder\s*(?P<u2>\d+(\.\d+)?)\b))",
+    re.IGNORECASE
+)
+
+STAT_MAP = {
+    "points": "puntos", "pts": "puntos", "puntos": "puntos",
+    "rebounds": "rebotes", "reb": "rebotes", "rebotes": "rebotes",
+    "assists": "asistencias", "ast": "asistencias", "asistencias": "asistencias",
+}
+
+def parse_polymarket_ou_title(title: str) -> List[dict]:
+    t = (title or "").strip().replace("•", " ").replace("|", " ")
+    m = PAR_LINE_RE.search(t)
+    if not m:
+        return []
+
+    player = (m.group("player") or "").strip().strip(".").title()
+    stat_raw = (m.group("stat") or "").lower().strip()
+    tipo = STAT_MAP.get(stat_raw)
+    if not player or not tipo:
+        return []
+
+    line_s = m.group("o1") or m.group("o2")
+    if not line_s:
+        return []
+
+    line = float(line_s)
+
+    return [
+        {"player": player, "tipo": tipo, "side": "over", "line": line},
+        {"player": player, "tipo": tipo, "side": "under", "line": line},
+    ]
+
+def polymarket_fetch_events(limit: int = 250) -> List[dict]:
+    url = f"{GAMMA}/events"
+    params = {
+        "active": "true",
+        "closed": "false",
+        "archived": "false",
+        "limit": str(limit),
+        "offset": "0",
+    }
+    r = SESSION_PM.get(url, params=params, timeout=25)
     r.raise_for_status()
-    data = r.json() or {}
-    markets = data.get("markets", []) or []
-    # Filtra algo parecido a props (PTS/REB/AST) y active
+    return r.json() or []
+
+def build_polymarket_universe_par(limit_events: int = 250) -> List[dict]:
+    events = polymarket_fetch_events(limit=limit_events)
+    universe = []
+
+    for ev in events:
+        title_ev = (ev.get("title") or "").lower()
+        if "nba" not in title_ev:
+            continue
+
+        markets = ev.get("markets") or []
+        for m in markets:
+            q = m.get("question") or m.get("title") or ""
+            low = q.lower()
+            if not any(k in low for k in ["puntos", "rebotes", "asistencias", "points", "rebounds", "assists", "pts", "reb", "ast"]):
+                continue
+
+            props = parse_polymarket_ou_title(q)
+            if props:
+                universe.extend(props)
+
+    seen = set()
     out = []
-    for m in markets:
-        title = (m.get("question") or m.get("title") or "").lower()
-        if any(x in title for x in [" points ", " rebounds ", " assists ", "pts", "reb", "ast"]):
-            out.append(m)
+    for p in universe:
+        key = (p["player"].lower(), p["tipo"], p["side"], float(p["line"]))
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+
     return out
 
 
@@ -518,21 +619,15 @@ def polymarket_nba_markets_today(limit: int = 50) -> List[dict]:
 HELP_TEXT = (
     "🧠 *NBA Interactive Bot*\n\n"
     "Comandos:\n"
+    "• `/today` → programación NBA de hoy\n"
+    "• `/odds`  → props P/R/A de Polymarket (sin cuotas)\n"
+    "• `/live`  → estado en vivo de tus props (si cargaste props.json)\n\n"
+    "Opcional:\n"
     "• `/add Nombre | tipo | side | linea`\n"
-    "   Ej: `/add Jalen Duren | puntos | over | 15.5`\n"
     "   Ej: `/add Nikola Jokic | asistencias | under | 9.5`\n"
-    "   tipo: puntos / rebotes / asistencias\n"
-    "   side: over / under\n\n"
-    "• `/live`  → estado en vivo de tus props\n"
-    "• `/odds`  → props NBA en Polymarket (búsqueda Gamma API)\n"
 )
 
 def parse_add(text: str) -> Optional[Prop]:
-    """
-    Formato robusto:
-      /add Nombre | tipo | side | linea
-    """
-    # quita "/add"
     body = text.strip()
     body = re.sub(r"^/add(@\w+)?\s*", "", body).strip()
     if "|" not in body:
@@ -553,7 +648,7 @@ def parse_add(text: str) -> Optional[Prop]:
         return None
     return Prop(player=name, tipo=tipo, side=side, line=line)
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -562,7 +657,6 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Formato inválido.\n\n" + HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
         return
 
-    # Resuelve PID para validar nombre (y cachea)
     pid = get_pid_for_name(p.player)
     if not pid:
         await update.message.reply_text(f"⚠️ No pude encontrar al jugador: {p.player}")
@@ -572,7 +666,6 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     p.added_at = now_ts()
 
     props = load_props()
-    # dedupe: mismo jugador/tipo/side/line
     for existing in props:
         if (existing.player.lower() == p.player.lower()
             and existing.tipo == p.tipo and existing.side == p.side and float(existing.line) == float(p.line)):
@@ -586,55 +679,77 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Agregado:\n• {p.player} — {p.tipo.upper()} {p.side.upper()} {p.line}",
     )
 
-async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        markets = polymarket_nba_markets_today(limit=80)
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Error Polymarket: {e}")
-        return
-
-    if not markets:
-        await update.message.reply_text("No encontré props NBA en Polymarket con el filtro actual.")
-        return
-
-    # Muestra top 10 por liquidez si existe, si no por orden
-    def liq(m):
-        return float(m.get("liquidity", 0) or 0)
-
-    markets = sorted(markets, key=liq, reverse=True)[:10]
-    lines = ["🟣 *Polymarket (top props encontrados)*"]
-    for m in markets:
-        q = m.get("question") or m.get("title") or "Market"
-        mid = m.get("id") or ""
-        lines.append(f"• {q} (id: `{mid}`)")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-
-async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    props = load_props()
-    if not props:
-        await update.message.reply_text("No hay props cargados. Usa /add.")
-        return
-
-    # agrupa por jugador
-    by_player: Dict[str, List[Prop]] = {}
-    for p in props:
-        by_player.setdefault(p.player, []).append(p)
-
-    # trae games live
+async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         games = scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"]
     except Exception as e:
         await update.message.reply_text(f"⚠️ No pude leer scoreboard: {e}")
         return
 
-    # mapa pid -> name (de props)
+    if not games:
+        await update.message.reply_text("No hay juegos en el scoreboard ahora mismo.")
+        return
+
+    def team_str(t: dict) -> str:
+        name = t.get("teamName") or t.get("teamCity") or "TEAM"
+        w = t.get("wins")
+        l = t.get("losses")
+        rec = f" ({w}-{l})" if (w is not None and l is not None) else ""
+        return f"{name}{rec}"
+
+    lines = ["🏀 *NBA Hoy — Programación*"]
+    for g in games:
+        home = team_str(g.get("homeTeam", {}) or {})
+        away = team_str(g.get("awayTeam", {}) or {})
+        st = int(g.get("gameStatus", 0) or 0)
+        st_text = g.get("gameStatusText", "") or ""
+        tag = "PRE" if st == 1 else ("LIVE" if st == 2 else "FINAL" if st == 3 else "—")
+        lines.append(f"• *{away} @ {home}* — `{tag}` — {st_text}")
+
+    msg = "\n".join(lines)
+    await update.message.reply_text(msg[:3800], parse_mode=ParseMode.MARKDOWN)
+
+async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        props = build_polymarket_universe_par(limit_events=250)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Error Polymarket: {e}")
+        return
+
+    if not props:
+        await update.message.reply_text(
+            "No pude parsear props P/R/A desde Polymarket.\n"
+            "Si me pegas 2-3 títulos exactos, ajusto el parser en 1 minuto."
+        )
+        return
+
+    lines = ["🟣 *Polymarket — Props P/R/A (sin cuotas)*"]
+    for p in props[:35]:
+        lines.append(f"• {p['player']} — {p['tipo']} {p['side'].upper()} {p['line']}")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    props = load_props()
+    if not props:
+        await update.message.reply_text("No hay props cargados en props.json. (Este comando es para props manuales).")
+        return
+
+    by_player: Dict[str, List[Prop]] = {}
+    for p in props:
+        by_player.setdefault(p.player, []).append(p)
+
+    try:
+        games = scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"]
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ No pude leer scoreboard: {e}")
+        return
+
     pid_map: Dict[int, str] = {}
     for name in by_player.keys():
         pid = get_pid_for_name(name)
         if pid:
             pid_map[pid] = name
 
-    # inspecciona boxscores live y construye respuesta
     out = []
     for g in games:
         if g.get("gameStatus") != 2:
@@ -661,7 +776,6 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ast = stats.get("assists", 0) or 0
                 mins = parse_minutes(stats.get("minutes", ""))
 
-                # lista props de ese jugador
                 ps = by_player.get(name, [])
                 if not ps:
                     continue
@@ -681,7 +795,6 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No hay partidos en vivo o ninguno de tus jugadores está jugando ahora.")
         return
 
-    # Telegram limita longitud: recorta si necesario
     msg = "\n".join(out)
     if len(msg) > 3500:
         msg = msg[:3500] + "\n…(recortado)"
@@ -689,11 +802,82 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# Background task: scan + alerts
+# Background scan: pregame + scoring + alerts
 # =========================
 async def background_scan(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
+
+    # games
+    try:
+        games = scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"]
+    except Exception:
+        return
+
+    # --- Pregame: Featured + T-90 ---
+    pre = load_pregame_state()
+
+    upcoming = []
+    for g in games:
+        if int(g.get("gameStatus", 0) or 0) != 1:
+            continue
+        m = minutes_to_start(g)
+        if m is None:
+            continue
+        upcoming.append((m, g))
+    upcoming.sort(key=lambda x: x[0])
+
+    # Partido destacado (una vez al día por juego)
+    if upcoming:
+        m, g0 = upcoming[0]
+        gid0 = g0.get("gameId")
+        if 0 < m <= 240:
+            key_feat = f"{gid0}:featured:{date.today().isoformat()}"
+            if mark_once(pre, key_feat):
+                ht = (g0.get("homeTeam") or {}).get("teamName", "HOME")
+                at = (g0.get("awayTeam") or {}).get("teamName", "AWAY")
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"⭐ *Partido destacado*\n"
+                        f"🏀 *{at} @ {ht}*\n"
+                        f"⏱️ Faltan aprox: `{int(round(m))} min`"
+                    ),
+                    parse_mode=ParseMode.MARKDOWN
+                )
+
+    # T-90 (±6 min)
+    for m, g in upcoming:
+        if not (84 <= m <= 96):
+            continue
+        gid = g.get("gameId")
+        key90 = f"{gid}:t90"
+        if mark_once(pre, key90):
+            ht = (g.get("homeTeam") or {}).get("teamName", "HOME")
+            at = (g.get("awayTeam") or {}).get("teamName", "AWAY")
+            st_text = g.get("gameStatusText", "")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"⏳ *PRE-GAME T-90*\n"
+                    f"🏀 *{at} @ {ht}*\n"
+                    f"🕒 {st_text}\n"
+                    f"📌 Ventana: empieza en ~1h30."
+                ),
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+    save_pregame_state(pre)
+
+    # --- Props fuente: props.json o universo Polymarket ---
     props = load_props()
+    if not props:
+        # modo automático: Polymarket
+        try:
+            pm = build_polymarket_universe_par(limit_events=250)
+            props = [Prop(player=p["player"], tipo=p["tipo"], side=p["side"], line=float(p["line"])) for p in pm]
+        except Exception:
+            return
+
     if not props:
         return
 
@@ -706,12 +890,7 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
         if pid:
             by_pid.setdefault(pid, []).append(p)
 
-    # games
-    try:
-        games = scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"]
-    except Exception:
-        return
-
+    # LIVE scan
     for g in games:
         if g.get("gameStatus") != 2:
             continue
@@ -721,7 +900,10 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
 
         home = g.get("homeTeam", {})
         away = g.get("awayTeam", {})
-        diff = abs(int(home.get("score", 0)) - int(away.get("score", 0)))
+        try:
+            diff = abs(int(home.get("score", 0)) - int(away.get("score", 0)))
+        except Exception:
+            diff = 0
 
         is_clutch = diff <= 8
         is_blowout = diff >= BLOWOUT_IS
@@ -753,14 +935,12 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
                 for pr in by_pid[pid]:
                     actual = pts if pr.tipo == "puntos" else (reb if pr.tipo == "rebotes" else ast)
 
-                    # PRE score (forma) para este lado
-                    pre, meta = pre_score(pid, pr.tipo, pr.line, pr.side)
+                    # PRE
+                    pre_sc, meta = pre_score(pid, pr.tipo, pr.line, pr.side)
 
-                    # LIVE score (oportunidad actual)
                     if pr.side == "over":
                         faltante = float(pr.line) - float(actual)
                         lo_over, hi_over = THRESH_POINTS_OVER if pr.tipo == "puntos" else THRESH_REB_AST_OVER
-
                         if not (lo_over <= faltante <= hi_over):
                             continue
                         if should_gate_by_minutes("over", pr.tipo, faltante, mins, elapsed_min, is_blowout):
@@ -770,13 +950,13 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
                                 continue
 
                         live = compute_over_score(pr.tipo, faltante, mins, pf, period, clock_sec, diff, is_clutch, is_blowout)
-                        final = int(clamp(0.55 * live + 0.45 * pre, 0, 100))
+                        final = int(clamp(0.55 * live + 0.45 * pre_sc, 0, 100))
                         key = f"{gid}|{pid}|{pr.tipo}|{pr.side}|{pr.line}"
 
                         if final >= FINAL_ALERT_THRESHOLD or (is_clutch and final >= FINAL_ALERT_THRESHOLD_CLUTCH):
                             if can_send_alert(state, key):
                                 msg = (
-                                    f"🎯 *ALERTA OVER* | *FINAL* `{final}/100` (LIVE {live} | PRE {pre})\n"
+                                    f"🎯 *ALERTA OVER* | *FINAL* `{final}/100` (LIVE {live} | PRE {pre_sc})\n"
                                     f"👤 *{name}*\n"
                                     f"📊 {pr.tipo.upper()} {actual}/{pr.line} (faltan {faltante:.1f})\n"
                                     f"⏱️ {status} | Q{period} {game_clock}\n"
@@ -785,18 +965,19 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
                                 )
                                 await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.MARKDOWN)
 
-                    else:  # UNDER
+                    else:
                         margin_under = float(pr.line) - float(actual)
                         if should_gate_by_minutes("under", pr.tipo, margin_under, mins, elapsed_min, is_blowout):
                             continue
+
                         live = compute_under_score(pr.tipo, margin_under, mins, pf, period, clock_sec, diff, is_clutch, is_blowout)
-                        final = int(clamp(0.65 * live + 0.35 * pre, 0, 100))
+                        final = int(clamp(0.65 * live + 0.35 * pre_sc, 0, 100))
                         key = f"{gid}|{pid}|{pr.tipo}|{pr.side}|{pr.line}"
 
                         if final >= FINAL_ALERT_THRESHOLD or (is_blowout and final >= FINAL_ALERT_THRESHOLD_CLUTCH):
                             if can_send_alert(state, key):
                                 msg = (
-                                    f"🧊 *ALERTA UNDER* | *FINAL* `{final}/100` (LIVE {live} | PRE {pre})\n"
+                                    f"🧊 *ALERTA UNDER* | *FINAL* `{final}/100` (LIVE {live} | PRE {pre_sc})\n"
                                     f"👤 *{name}*\n"
                                     f"📊 {pr.tipo.upper()} {actual}/{pr.line} (colchón {margin_under:.1f})\n"
                                     f"⏱️ {status} | Q{period} {game_clock}\n"
@@ -809,41 +990,36 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# Main
+# Startup / main
 # =========================
 async def on_startup(app: Application):
-    log.info("Bot arrancado. props.json persistente.")
+    log.info("Bot arrancado. Background scan via /start.")
+
+async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    jobs = context.job_queue.get_jobs_by_name(f"scan:{chat_id}")
+    if not jobs:
+        context.job_queue.run_repeating(
+            background_scan,
+            interval=POLL_SECONDS,
+            first=5,
+            chat_id=chat_id,
+            name=f"scan:{chat_id}",
+        )
+        await update.message.reply_text(f"✅ Background scan activado (cada {POLL_SECONDS}s).")
+    await cmd_help(update, context)
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.post_init = on_startup
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_start))
+    app.add_handler(CommandHandler("start", register_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("today", cmd_today))
+    app.add_handler(CommandHandler("odds", cmd_odds))
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("live", cmd_live))
-    app.add_handler(CommandHandler("odds", cmd_odds))
 
-    # Background scan: se agenda por chat (primer chat que te escribe)
-    # Solución práctica PC: usar /start para registrar chat y job.
-    async def register_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat_id = update.effective_chat.id
-        # si ya existe job, no duplicar
-        jobs = context.job_queue.get_jobs_by_name(f"scan:{chat_id}")
-        if not jobs:
-            context.job_queue.run_repeating(
-                background_scan,
-                interval=POLL_SECONDS,
-                first=5,
-                chat_id=chat_id,
-                name=f"scan:{chat_id}",
-            )
-            await update.message.reply_text("✅ Background scan activado (cada 120s).")
-        await cmd_start(update, context)
-
-    # Sobrescribe /start para registrar el job
-    app.add_handler(CommandHandler("start", register_job), group=0)
-
-    app.post_init = on_startup
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
