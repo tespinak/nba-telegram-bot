@@ -31,10 +31,10 @@ from nba_api.stats.static import players
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("nba-bot")
 
-TELEGRAM_TOKEN = "8790190921:AAG-6Q7Oe9gb-HqmR55ZpXxi4t5P849tQM4"
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_TOKEN env var")
-
+    raise RuntimeError("Missing TELEGRAM_TOKEN env var (set it in Railway Variables)")
+   
 POLL_SECONDS = 120
 PROPS_FILE = "props.json"
 ALERTS_STATE_FILE = "alerts_state.json"
