@@ -8,7 +8,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timezone, timedelta, date
+from datetime import datetime, timezone, date, timedelta
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -25,58 +25,48 @@ from telegram.ext import (
 from nba_api.live.nba.endpoints import scoreboard, boxscore
 from nba_api.stats.static import players
 
-
 # =========================
-# LOGGING
+# CONFIG
 # =========================
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("nba-bot")
 
-
-# =========================
-# ENV / CONFIG
-# =========================
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_TOKEN = (os.environ.get("TELEGRAM_TOKEN") or "").strip()
 if not TELEGRAM_TOKEN:
-    raise RuntimeError("Missing TELEGRAM_TOKEN (Railway Variables / env var).")
+    raise RuntimeError("Missing TELEGRAM_TOKEN env var. Set it in Railway Variables or your shell.")
 
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "120"))
-SEASON = os.environ.get("NBA_SEASON", "2025-26")
 
-# files
+PROPS_FILE = "props.json"              # opcional (manual)
 ALERTS_STATE_FILE = "alerts_state.json"
 IDS_CACHE_FILE = "player_ids_cache.json"
 GLOG_CACHE_FILE = "gamelog_cache.json"
 
-# scoring thresholds
+SEASON = os.environ.get("NBA_SEASON", "2025-26")
+
 FINAL_ALERT_THRESHOLD = 75
 FINAL_ALERT_THRESHOLD_CLUTCH = 68
+
 COOLDOWN_SECONDS = 8 * 60
 BLOWOUT_IS = 20
 BLOWOUT_STRONG = 22
 
-# Near-line windows (LIVE)
 THRESH_POINTS_OVER = (0.5, 4.0)
 THRESH_REB_AST_OVER = (0.5, 1.5)
 
 MIN_MINUTES_POINTS = 10.0
 MIN_MINUTES_REB_AST = 14.0
 
-# PRE scoring columns
 STAT_COL = {"puntos": "PTS", "rebotes": "REB", "asistencias": "AST"}
 STD_CAP = {"puntos": 8.0, "rebotes": 4.0, "asistencias": 3.0}
 MARGIN_CAP = {"puntos": 8.0, "rebotes": 3.0, "asistencias": 3.0}
 
-# Polymarket Gamma
+# Polymarket Gamma API
 GAMMA = "https://gamma-api.polymarket.com"
-NBA_SERIES_ID_ENV = os.environ.get("PM_NBA_SERIES_ID", "").strip()  # opcional override
-
-# Pregame
-PREGAME_T90_MIN = 90
-PREGAME_TOL_MIN = 8
-PREGAME_STATE_FILE = "pregame_state.json"
-PREGAME_TOP_K = 10  # top players por PRE para vigilar
-
+PM_NBA_SERIES_ID = (os.environ.get("PM_NBA_SERIES_ID") or "").strip()  # si lo pones, no adivina
+PM_LOOKAHEAD_HOURS = int(os.environ.get("PM_LOOKAHEAD_HOURS", "24"))
+PM_MAX_EVENTS = int(os.environ.get("PM_MAX_EVENTS", "20"))
+PM_MAX_MARKETS = int(os.environ.get("PM_MAX_MARKETS", "500"))
 
 # =========================
 # HTTP sessions
@@ -136,9 +126,6 @@ def save_json(path: str, data):
 def now_ts() -> int:
     return int(time.time())
 
-def clamp(x, lo=0, hi=100):
-    return max(lo, min(hi, x))
-
 
 # =========================
 # Data model
@@ -146,22 +133,30 @@ def clamp(x, lo=0, hi=100):
 @dataclass
 class Prop:
     player: str
-    tipo: str          # "puntos" | "rebotes" | "asistencias"
+    tipo: str              # puntos | rebotes | asistencias
     line: float
-    side: str          # "over" | "under"
-    event_id: Optional[str] = None
-    event_name: Optional[str] = None
-    start_time_utc: Optional[str] = None  # ISO string
+    side: str              # over | under
+    source: str = "manual" # manual | polymarket
+    event: Optional[str] = None
+    market_id: Optional[str] = None
 
-def prop_key(p: Prop) -> str:
-    return f"{p.player.lower()}|{p.tipo}|{p.side}|{p.line}"
+
+def load_props() -> List[Prop]:
+    raw = load_json(PROPS_FILE, {"props": []})
+    out = []
+    for p in raw.get("props", []):
+        try:
+            out.append(Prop(**p))
+        except Exception:
+            continue
+    return out
 
 
 # =========================
 # Player ID cache
 # =========================
 def obtener_id_jugador(nombre: str) -> Optional[int]:
-    time.sleep(0.2 + random.random() * 0.2)
+    time.sleep(0.15 + random.random() * 0.15)
     res = players.find_players_by_full_name(nombre)
     if not res:
         return None
@@ -188,9 +183,9 @@ def get_pid_for_name(name: str) -> Optional[int]:
 
 
 # =========================
-# Gamelog cache + fetch
+# Gamelog cache + fetch (stats.nba.com)
 # =========================
-GLOG_TTL_SECONDS = 6 * 60 * 60  # 6h
+GLOG_TTL_SECONDS = 6 * 60 * 60
 
 def load_glog_cache():
     return load_json(GLOG_CACHE_FILE, {})
@@ -228,6 +223,7 @@ def get_gamelog_table(pid: int) -> Tuple[List[str], List[list]]:
         if not rs:
             single = data.get("resultSet")
             rs = [single] if single else []
+
         if not rs or not isinstance(rs[0], dict):
             return cache.get(k, {}).get("headers", []), cache.get(k, {}).get("rows", [])
 
@@ -237,13 +233,17 @@ def get_gamelog_table(pid: int) -> Tuple[List[str], List[list]]:
         cache[k] = {"ts": now, "headers": headers, "rows": rows}
         save_glog_cache(cache)
         return headers, rows
+
     except Exception:
         return cache.get(k, {}).get("headers", []), cache.get(k, {}).get("rows", [])
 
 
 # =========================
-# PRE scoring (forma 5/10)
+# PRE score (forma 5/10)
 # =========================
+def clamp(x, lo=0, hi=100):
+    return max(lo, min(hi, x))
+
 def stdev(vals: List[float]) -> float:
     if not vals or len(vals) < 2:
         return 0.0
@@ -316,9 +316,9 @@ def pre_score(pid: int, tipo: str, line: float, side: str) -> Tuple[int, dict]:
     PRE = int(clamp(0.55 * HitScore + 0.25 * MarginScore + 0.20 * ConsistencyScore, 0, 100))
 
     meta = {
-        "hits5": h5, "n5": n5, "hits10": h10, "n10": n10,
+        "hits5": h5, "n5": n5,
+        "hits10": h10, "n10": n10,
         "avg5": round(avg5, 2), "avg10": round(avg10, 2),
-        "std10": round(std10, 2), "w_margin": round(w_margin, 2),
     }
     return PRE, meta
 
@@ -367,9 +367,9 @@ def game_elapsed_minutes(period: int, clock_seconds: Optional[int]) -> Optional[
 
 
 # =========================
-# LIVE score
+# LIVE score (compacto)
 # =========================
-def should_gate_by_minutes(side: str, tipo: str, value: float, mins: float, elapsed_min, is_blowout: bool) -> bool:
+def should_gate_by_minutes(side: str, tipo: str, mins: float, elapsed_min, is_blowout: bool) -> bool:
     if side == "over":
         if elapsed_min is not None and elapsed_min >= 18:
             return False
@@ -466,7 +466,7 @@ def compute_under_score(tipo, margin_under, mins, pf, period, clock_seconds, dif
 
 
 # =========================
-# Alert state
+# Alert cooldown per prop
 # =========================
 def load_alert_state():
     return load_json(ALERTS_STATE_FILE, {})
@@ -484,68 +484,47 @@ def can_send_alert(state: dict, key: str) -> bool:
 
 
 # =========================
-# Pregame state
-# =========================
-def load_pregame_state():
-    return load_json(PREGAME_STATE_FILE, {})
-
-def save_pregame_state(st):
-    save_json(PREGAME_STATE_FILE, st)
-
-def in_window(m: float, target: float, tol: float) -> bool:
-    return (target - tol) <= m <= (target + tol)
-
-
-# =========================
-# Polymarket discovery (ROBUST)
+# Polymarket Gamma helpers
 # =========================
 def pm_get_json(path: str, params: dict) -> dict:
     url = f"{GAMMA}{path}"
-    r = SESSION_PM.get(url, params=params, timeout=30)
+    r = SESSION_PM.get(url, params=params, timeout=25)
     r.raise_for_status()
-    return r.json() if r.content else {}
+    return r.json()
 
 def pm_find_nba_series_id() -> Optional[str]:
-    # allow override
-    if NBA_SERIES_ID_ENV:
-        return NBA_SERIES_ID_ENV
+    # if user pinned it, best option
+    if PM_NBA_SERIES_ID:
+        return PM_NBA_SERIES_ID
 
     data = pm_get_json("/sports", {})
-    # /sports suele devolver lista
-    if isinstance(data, list):
-        sports_list = data
-    else:
-        sports_list = data.get("sports", []) or data.get("data", []) or []
+    sports_list = data if isinstance(data, list) else (data.get("sports", []) or data.get("data", []) or [])
 
     best = None
     for s in sports_list:
-        # keys típicas: sport, name, series, series_id, etc.
         sport_key = (s.get("sport") or s.get("key") or s.get("slug") or "").lower()
         name = (s.get("name") or "").lower()
-        if "nba" in sport_key or name.strip() == "nba":
+        if sport_key == "nba" or name.strip() == "nba":
             best = s
             break
 
     if not best:
-        # fallback: busca por "basketball" + "nba"
         for s in sports_list:
-            name = (s.get("name") or "").lower()
-            if "nba" in name:
+            if "nba" in (s.get("sport") or "").lower() or "nba" in (s.get("name") or "").lower():
                 best = s
                 break
 
     if not best:
         return None
 
-    # series id puede venir en distintos campos
-    sid = best.get("series_id") or best.get("seriesId")
+    # ✅ en tu payload viene como "series":"10345"
+    sid = best.get("series_id") or best.get("seriesId") or best.get("series")
     if sid:
         return str(sid)
 
-    # a veces "series" es array; elige el que contenga nba
+    # fallback: si "series" fuese lista
     series = best.get("series") or []
     if isinstance(series, list) and series:
-        # intenta campo id
         for it in series:
             if isinstance(it, dict):
                 _id = it.get("id") or it.get("series_id") or it.get("seriesId")
@@ -554,208 +533,170 @@ def pm_find_nba_series_id() -> Optional[str]:
 
     return None
 
-def pm_events_next_24h(series_id: str, limit: int = 200) -> List[dict]:
-    # Trae eventos activos del league, ordenados por startTime
+def pm_events_next_window(series_id: str, lookahead_hours: int = 24, limit: int = 20) -> List[dict]:
+    now = datetime.now(timezone.utc)
+    end = now + timedelta(hours=lookahead_hours)
+
+    # intentamos con ambos params (series_id y series) por robustez
     params = {
         "series_id": series_id,
+        "series": series_id,
         "active": "true",
         "closed": "false",
-        "order": "startTime",
+        "archived": "false",
+        "order": "startDate",
         "ascending": "true",
         "limit": str(limit),
         "offset": "0",
     }
+
     data = pm_get_json("/events", params)
-    # /events suele devolver lista directamente
-    if isinstance(data, list):
-        return data
-    return data.get("events", []) or data.get("data", []) or []
+    events = data if isinstance(data, list) else (data.get("events", []) or data.get("data", []) or [])
 
-def parse_iso_dt(s: str) -> Optional[datetime]:
-    if not s:
-        return None
-    try:
-        # suele venir con Z
-        if s.endswith("Z"):
-            return datetime.fromisoformat(s.replace("Z", "+00:00"))
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-def pm_filter_today_or_24h(events: List[dict]) -> List[dict]:
-    now = datetime.now(timezone.utc)
-    horizon = now + timedelta(hours=24)
     out = []
     for e in events:
-        st = parse_iso_dt(e.get("startTime") or e.get("start_time") or e.get("start_time_utc") or "")
-        if not st:
+        dt_s = e.get("startDate") or e.get("start_date") or e.get("startTime") or e.get("start_time")
+        if not dt_s:
             continue
-        if now - timedelta(hours=2) <= st <= horizon:
+        try:
+            dt = datetime.fromisoformat(dt_s.replace("Z", "+00:00")).astimezone(timezone.utc)
+        except Exception:
+            continue
+        if now <= dt <= end:
             out.append(e)
     return out
 
-_STAT_MAP = {
+def pm_markets_for_event(event_id: str, limit: int = 500) -> List[dict]:
+    params = {
+        "event_id": event_id,
+        "active": "true",
+        "closed": "false",
+        "archived": "false",
+        "limit": str(limit),
+        "offset": "0",
+    }
+    data = pm_get_json("/markets", params)
+    markets = data if isinstance(data, list) else (data.get("markets", []) or data.get("data", []) or [])
+    return markets
+
+# --- Parse props P/R/A desde market strings ---
+# intentamos detectar:
+# - player: al inicio
+# - stat: points/rebounds/assists
+# - line: float
+STAT_ALIASES = {
     "points": "puntos",
     "point": "puntos",
+    "pts": "puntos",
     "rebounds": "rebotes",
     "rebound": "rebotes",
+    "reb": "rebotes",
     "assists": "asistencias",
     "assist": "asistencias",
-    "pts": "puntos",
-    "reb": "rebotes",
     "ast": "asistencias",
 }
 
-def _norm_stat_from_text(t: str) -> Optional[str]:
-    tl = (t or "").lower()
-    for k, v in _STAT_MAP.items():
-        if re.search(rf"\b{k}\b", tl):
-            return v
+def normalize_stat(s: str) -> Optional[str]:
+    s = s.lower().strip()
+    return STAT_ALIASES.get(s)
+
+def try_parse_prop_from_text(text: str) -> Optional[Tuple[str, str, float]]:
+    """
+    Devuelve (player, tipo, line) o None.
+    """
+    t = " ".join((text or "").split())
+    if not t:
+        return None
+
+    # patrones comunes
+    # 1) "Cade Cunningham points 25.5"
+    m = re.search(r"^(?P<player>[A-Za-zÀ-ÿ.'\- ]+?)\s+(?P<stat>points|pts|rebounds|reb|assists|ast)\s+(?P<line>\d+(?:\.\d+)?)\b", t, re.I)
+    if m:
+        player = m.group("player").strip()
+        tipo = normalize_stat(m.group("stat"))
+        line = float(m.group("line"))
+        if tipo:
+            return player, tipo, line
+
+    # 2) "Cade Cunningham - Points (25.5)"
+    m = re.search(r"^(?P<player>[A-Za-zÀ-ÿ.'\- ]+?)\s*[-:]\s*(?P<stat>points|pts|rebounds|reb|assists|ast)\s*\(?(?P<line>\d+(?:\.\d+)?)\)?", t, re.I)
+    if m:
+        player = m.group("player").strip()
+        tipo = normalize_stat(m.group("stat"))
+        line = float(m.group("line"))
+        if tipo:
+            return player, tipo, line
+
+    # 3) "Points - Cade Cunningham - 25.5" (menos común)
+    m = re.search(r"(?P<stat>points|pts|rebounds|reb|assists|ast).{0,15}(?P<player>[A-Za-zÀ-ÿ.'\- ]+?).{0,10}(?P<line>\d+(?:\.\d+)?)", t, re.I)
+    if m:
+        player = m.group("player").strip()
+        tipo = normalize_stat(m.group("stat"))
+        line = float(m.group("line"))
+        if tipo:
+            return player, tipo, line
+
     return None
 
-def pm_market_to_props(m: dict, event_meta: dict) -> List[Prop]:
+def polymarket_props_today() -> Tuple[List[Prop], List[dict]]:
     """
-    Soporta dos formatos:
-      A) question incluye Over/Under y línea
-      B) question incluye stat + outcomes incluyen Over X / Under X
+    Devuelve (props, events_info).
+    props: lista Prop con over+under para cada market parseado.
+    events_info: lista con {title, startDate, id} de los eventos.
     """
-    q = (m.get("question") or m.get("title") or "").strip()
-    ql = q.lower()
-
-    event_id = str(event_meta.get("id") or "")
-    event_name = (event_meta.get("title") or event_meta.get("name") or "").strip()
-    st = (event_meta.get("startTime") or "").strip()
-
-    out: List[Prop] = []
-
-    # A) explícito: "Chet Holmgren assists over 1.5"
-    rx = re.compile(
-        r"^(?P<player>.+?)\s+(?P<stat>points|rebounds|assists)\s+(?P<side>over|under)\s+(?P<line>\d+(?:\.\d+)?)\b",
-        re.IGNORECASE,
-    )
-    m1 = rx.search(q)
-    if m1:
-        player = m1.group("player").strip()
-        tipo = _STAT_MAP.get(m1.group("stat").lower())
-        side = m1.group("side").lower()
-        line = float(m1.group("line"))
-        if tipo:
-            out.append(Prop(player=player, tipo=tipo, side=side, line=line, event_id=event_id, event_name=event_name, start_time_utc=st))
-        return out
-
-    # otro estilo con guiones: "Player - Assists - Over 1.5"
-    rx2 = re.compile(
-        r"^(?P<player>.+?)\s*[-:]\s*(?P<stat>points|rebounds|assists)\s*[-:]\s*(?P<side>over|under)\s*(?P<line>\d+(?:\.\d+)?)\b",
-        re.IGNORECASE,
-    )
-    m2 = rx2.search(q)
-    if m2:
-        player = m2.group("player").strip()
-        tipo = _STAT_MAP.get(m2.group("stat").lower())
-        side = m2.group("side").lower()
-        line = float(m2.group("line"))
-        if tipo:
-            out.append(Prop(player=player, tipo=tipo, side=side, line=line, event_id=event_id, event_name=event_name, start_time_utc=st))
-        return out
-
-    # B) outcomes contienen Over/Under X; q contiene stat
-    tipo = _norm_stat_from_text(q)
-    outcomes_raw = m.get("outcomes")
-    try:
-        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else (outcomes_raw or [])
-    except Exception:
-        outcomes = outcomes_raw or []
-
-    if tipo and isinstance(outcomes, list) and outcomes:
-        # busca "Over 1.5" / "Under 1.5"
-        rx_out = re.compile(r"^(Over|Under)\s*(\d+(?:\.\d+)?)$", re.IGNORECASE)
-        parsed = []
-        for o in outcomes:
-            if not isinstance(o, str):
-                continue
-            mo = rx_out.match(o.strip())
-            if mo:
-                side = mo.group(1).lower()
-                line = float(mo.group(2))
-                parsed.append((side, line))
-        if parsed:
-            # player: intenta derivarlo del question removiendo el stat
-            player = q
-            # recorta por stat word
-            player = re.sub(r"\b(points|rebounds|assists)\b.*$", "", player, flags=re.IGNORECASE).strip(" -:")
-            if not player:
-                player = q.split(" ")[0].strip()
-
-            for side, line in parsed:
-                out.append(Prop(player=player, tipo=tipo, side=side, line=line, event_id=event_id, event_name=event_name, start_time_utc=st))
-            return out
-
-    return out
-
-def polymarket_props_pra_next24h() -> List[Prop]:
     sid = pm_find_nba_series_id()
     if not sid:
-        return []
-    events = pm_events_next_24h(sid, limit=200)
-    events = pm_filter_today_or_24h(events)
+        return [], []
+
+    events = pm_events_next_window(sid, lookahead_hours=PM_LOOKAHEAD_HOURS, limit=PM_MAX_EVENTS)
+    if not events:
+        return [], []
 
     props: List[Prop] = []
-    for e in events:
-        markets = e.get("markets") or []
-        if not isinstance(markets, list):
-            continue
-        for m in markets:
-            props.extend(pm_market_to_props(m, e))
-
-    # dedupe
+    ev_info = []
     seen = set()
-    uniq = []
-    for p in props:
-        k = prop_key(p)
-        if k in seen:
+
+    for e in events:
+        eid = str(e.get("id") or "")
+        title = e.get("title") or e.get("name") or e.get("ticker") or f"event {eid}"
+        start = e.get("startDate") or e.get("start_date") or e.get("startTime") or e.get("start_time") or ""
+        ev_info.append({"id": eid, "title": title, "startDate": start})
+
+        if not eid:
             continue
-        seen.add(k)
-        uniq.append(p)
-    return uniq
 
+        try:
+            markets = pm_markets_for_event(eid, limit=PM_MAX_MARKETS)
+        except Exception:
+            continue
 
-# =========================
-# NBA schedule helper (records if present)
-# =========================
-def nba_games_today_str() -> str:
-    try:
-        games = scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"]
-    except Exception:
-        return "No pude leer el scoreboard de NBA."
+        for m in markets:
+            # strings típicos: question / title
+            text = m.get("question") or m.get("title") or m.get("subtitle") or ""
+            parsed = try_parse_prop_from_text(text)
+            if not parsed:
+                continue
 
-    lines = []
-    for g in games:
-        # status 1 pregame, 2 live, 3 final
-        home = g.get("homeTeam", {}) or {}
-        away = g.get("awayTeam", {}) or {}
-        hn = home.get("teamName", "HOME")
-        an = away.get("teamName", "AWAY")
-        hs = home.get("score", 0)
-        as_ = away.get("score", 0)
-        st = g.get("gameStatusText", "")
-        # a veces vienen wins/losses
-        hw = home.get("wins")
-        hl = home.get("losses")
-        aw = away.get("wins")
-        al = away.get("losses")
-        rec_h = f" ({hw}-{hl})" if hw is not None and hl is not None else ""
-        rec_a = f" ({aw}-{al})" if aw is not None and al is not None else ""
-        if int(g.get("gameStatus", 0) or 0) == 2:
-            lines.append(f"🏀 {an}{rec_a} @ {hn}{rec_h} — *LIVE* {as_}-{hs} | {st}")
-        else:
-            lines.append(f"🏀 {an}{rec_a} @ {hn}{rec_h} — {st}")
+            player, tipo, line = parsed
+            market_id = str(m.get("id") or "")
 
-    if not lines:
-        return "No aparecen partidos hoy en el scoreboard."
-    return "📅 *NBA hoy*\n" + "\n".join(lines)
+            # over+under
+            for side in ("over", "under"):
+                key = (player.lower(), tipo, float(line), side, eid, market_id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                props.append(Prop(
+                    player=player,
+                    tipo=tipo,
+                    line=float(line),
+                    side=side,
+                    source="polymarket",
+                    event=title,
+                    market_id=market_id,
+                ))
+
+    return props, ev_info
 
 
 # =========================
@@ -764,77 +705,96 @@ def nba_games_today_str() -> str:
 HELP_TEXT = (
     "🧠 *NBA Interactive Bot*\n\n"
     "Comandos:\n"
-    "• `/odds`  → props P/R/A (Polymarket) para próximas 24h\n"
-    "• `/live`  → estado en vivo de esos props (si hay juegos live)\n"
-    "• `/today` → programación NBA de hoy (y records si vienen)\n\n"
-    "Auto:\n"
-    "• Scan cada 120s → alerta si FINAL ≥ 75\n"
-    "• Pregame T-90 → partido destacado + jugadores en racha\n"
+    "• `/odds`  → trae props P/R/A desde Polymarket y los devuelve en JSON\n"
+    "• `/live`  → estado en vivo (usa Polymarket; si no hay, usa props.json)\n"
+    "• `/start` → activa background scan cada 120s\n"
 )
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
 
-async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(nba_games_today_str(), parse_mode=ParseMode.MARKDOWN)
-
 async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    props = polymarket_props_pra_next24h()
+    try:
+        props, events = polymarket_props_today()
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Error Polymarket: {e}")
+        return
+
     if not props:
         await update.message.reply_text("No pude parsear props P/R/A desde Polymarket (0 encontrados).")
         return
 
-    # agrupa por evento y limita
-    by_event: Dict[str, List[Prop]] = {}
+    # agrupa JSON por evento
+    by_event: Dict[str, List[dict]] = {}
     for p in props:
-        by_event.setdefault(p.event_name or "NBA", []).append(p)
+        ev = p.event or "NBA"
+        by_event.setdefault(ev, []).append({
+            "player": p.player,
+            "tipo": p.tipo,
+            "line": p.line,
+            "side": p.side,
+            "market_id": p.market_id,
+        })
 
-    lines = ["🟣 *Polymarket — Props P/R/A (próx. 24h)*"]
-    shown = 0
-    for ev, plist in list(by_event.items())[:8]:
-        lines.append(f"\n*{ev}*")
-        # muestra hasta 10 por evento
-        for p in plist[:10]:
-            stat = "PTS" if p.tipo == "puntos" else ("REB" if p.tipo == "rebotes" else "AST")
-            lines.append(f"• {p.player} — {stat} {p.side.upper()} {p.line}")
-            shown += 1
-            if shown >= 60:
-                break
-        if shown >= 60:
-            break
+    payload = {
+        "series_id": pm_find_nba_series_id(),
+        "events": events[:25],
+        "props": by_event,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "note": "Precios omitidos a propósito (cambian).",
+    }
 
-    msg = "\n".join(lines)
-    if len(msg) > 3800:
-        msg = msg[:3800] + "\n…(recortado)"
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    txt = json.dumps(payload, ensure_ascii=False, indent=2)
+    # Telegram puede truncar: dividimos si hace falta
+    if len(txt) <= 3500:
+        await update.message.reply_text(f"```json\n{txt}\n```", parse_mode=ParseMode.MARKDOWN)
+    else:
+        # manda en chunks
+        chunks = [txt[i:i+3000] for i in range(0, len(txt), 3000)]
+        await update.message.reply_text("📦 JSON muy largo — lo mando en partes.", parse_mode=ParseMode.MARKDOWN)
+        for c in chunks[:6]:  # hard cap por seguridad
+            await update.message.reply_text(f"```json\n{c}\n```", parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    props = polymarket_props_pra_next24h()
+    # 1) intentar Polymarket (auto)
+    props: List[Prop] = []
+    try:
+        props, _ = polymarket_props_today()
+    except Exception:
+        props = []
+
+    # 2) fallback manual
     if not props:
-        await update.message.reply_text("No pude cargar props de Polymarket (0).")
+        props = load_props()
+
+    if not props:
+        await update.message.reply_text("No pude cargar props (ni props.json ni Polymarket).")
         return
 
-    # pid -> list props
-    by_pid: Dict[int, List[Prop]] = {}
+    # mapa player->props
+    by_player: Dict[str, List[Prop]] = {}
     for p in props:
-        pid = get_pid_for_name(p.player)
-        if pid:
-            by_pid.setdefault(pid, []).append(p)
+        by_player.setdefault(p.player, []).append(p)
 
-    if not by_pid:
-        await update.message.reply_text("No pude resolver IDs de jugadores para esos props.")
-        return
-
+    # games live
     try:
         games = scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"]
     except Exception as e:
         await update.message.reply_text(f"⚠️ No pude leer scoreboard: {e}")
         return
 
+    # mapa pid -> name (solo para jugadores en props)
+    pid_map: Dict[int, str] = {}
+    for name in by_player.keys():
+        pid = get_pid_for_name(name)
+        if pid:
+            pid_map[pid] = name
+
     out = []
     for g in games:
-        if int(g.get("gameStatus", 0) or 0) != 2:
+        if g.get("gameStatus") != 2:
             continue
+
         gid = g.get("gameId")
         status = g.get("gameStatusText", "")
         period = int(g.get("period", 0) or 0)
@@ -848,153 +808,58 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for team_key in ["homeTeam", "awayTeam"]:
             for pl in box.get(team_key, {}).get("players", []):
                 pid = pl.get("personId")
-                if pid not in by_pid:
+                if pid not in pid_map:
                     continue
 
+                name = pid_map[pid]
                 stats = pl.get("statistics", {})
                 pts = stats.get("points", 0) or 0
                 reb = stats.get("reboundsTotal", 0) or 0
                 ast = stats.get("assists", 0) or 0
                 mins = parse_minutes(stats.get("minutes", ""))
 
-                plist = by_pid[pid]
-                name = plist[0].player
+                ps = by_player.get(name, [])
+                if not ps:
+                    continue
+
                 out.append(f"🏀 *{name}* — {status} (Q{period} {clock}) | MIN {mins:.1f}")
-                for pr in plist[:6]:
+                for pr in ps:
                     actual = pts if pr.tipo == "puntos" else (reb if pr.tipo == "rebotes" else ast)
                     if pr.side == "over":
                         need = pr.line - actual
-                        out.append(f"  • {pr.tipo.upper()} OVER {pr.line}: {actual} (faltan {need:.1f})")
+                        out.append(f"  • {pr.tipo} OVER {pr.line}: {actual} (faltan {need:.1f})")
                     else:
                         cushion = pr.line - actual
-                        out.append(f"  • {pr.tipo.upper()} UNDER {pr.line}: {actual} (colchón {cushion:.1f})")
+                        out.append(f"  • {pr.tipo} UNDER {pr.line}: {actual} (colchón {cushion:.1f})")
                 out.append("")
 
     if not out:
-        await update.message.reply_text("No hay partidos en vivo ahora (o ningún jugador con props está jugando).")
+        await update.message.reply_text("No hay partidos en vivo o ninguno de esos jugadores está jugando ahora.")
         return
 
     msg = "\n".join(out)
-    if len(msg) > 3800:
-        msg = msg[:3800] + "\n…(recortado)"
+    if len(msg) > 3500:
+        msg = msg[:3500] + "\n…(recortado)"
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
 # =========================
-# Pregame notifications (T-90)
-# =========================
-def parse_game_start_utc(game_obj: dict) -> Optional[datetime]:
-    candidates = [
-        game_obj.get("gameTimeUTC"),
-        game_obj.get("gameTimeUtc"),
-        game_obj.get("gameTimeISO"),
-        game_obj.get("gameTime"),
-        game_obj.get("gameTimeUTCString"),
-    ]
-    for c in candidates:
-        if not c:
-            continue
-        s = str(c)
-        try:
-            if s.endswith("Z"):
-                return datetime.fromisoformat(s.replace("Z", "+00:00")).astimezone(timezone.utc)
-            dt = datetime.fromisoformat(s)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.astimezone(timezone.utc)
-        except Exception:
-            continue
-    return None
-
-def minutes_to_start(game_obj: dict) -> Optional[float]:
-    start = parse_game_start_utc(game_obj)
-    if not start:
-        return None
-    now = datetime.now(timezone.utc)
-    return (start - now).total_seconds() / 60.0
-
-async def pregame_t90_if_needed(context: ContextTypes.DEFAULT_TYPE):
-    # toma juegos pregame del scoreboard
-    try:
-        games = scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"]
-    except Exception:
-        return
-
-    st = load_pregame_state()
-    props = polymarket_props_pra_next24h()
-
-    # si no hay props, igual manda partidos del día
-    for g in games:
-        if int(g.get("gameStatus", 0) or 0) != 1:
-            continue
-
-        m = minutes_to_start(g)
-        if m is None:
-            continue
-
-        if not in_window(m, PREGAME_T90_MIN, PREGAME_TOL_MIN):
-            continue
-
-        gid = g.get("gameId", "")
-        key = f"{gid}:t90"
-        if key in st:
-            continue
-        st[key] = now_ts()
-
-        home = (g.get("homeTeam") or {}).get("teamName", "HOME")
-        away = (g.get("awayTeam") or {}).get("teamName", "AWAY")
-        status_text = g.get("gameStatusText", "")
-
-        # "partido destacado": el event con más props (proxy)
-        featured = None
-        if props:
-            # heurística: el evento con más props
-            counts: Dict[str, int] = {}
-            for p in props:
-                if p.event_name:
-                    counts[p.event_name] = counts.get(p.event_name, 0) + 1
-            if counts:
-                featured = sorted(counts.items(), key=lambda x: x[1], reverse=True)[0][0]
-
-        # top racha: PRE score alto en próximos props
-        hot_lines = []
-        if props:
-            # calcula PRE para muestra (cap)
-            scored = []
-            for p in props[:80]:  # limita para no matar rate limits
-                pid = get_pid_for_name(p.player)
-                if not pid:
-                    continue
-                pre, meta = pre_score(pid, p.tipo, p.line, p.side)
-                scored.append((pre, p, meta))
-                time.sleep(0.05)
-            scored.sort(key=lambda x: x[0], reverse=True)
-            for pre, p, meta in scored[:PREGAME_TOP_K]:
-                stat = "PTS" if p.tipo == "puntos" else ("REB" if p.tipo == "rebotes" else "AST")
-                hot_lines.append(f"• {p.player} — {stat} {p.side.upper()} {p.line} | PRE {pre}/100 | hit10 {meta['hits10']}/{meta['n10']}")
-
-        msg = (
-            f"⏳ *PRE-GAME T-90*\n"
-            f"🏀 *{away} @ {home}*\n"
-            f"🕒 {status_text}\n"
-        )
-        if featured:
-            msg += f"\n⭐ *Partido destacado (hoy):* {featured}\n"
-        if hot_lines:
-            msg += "\n🔥 *Jugadores en racha (según props Polymarket + últimos 10):*\n" + "\n".join(hot_lines[:10])
-
-        await context.bot.send_message(chat_id=context.job.chat_id, text=msg, parse_mode=ParseMode.MARKDOWN)
-
-    save_pregame_state(st)
-
-
-# =========================
-# Background scan
+# Background scan + alerts (usa Polymarket o manual)
 # =========================
 async def background_scan(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
 
-    props = polymarket_props_pra_next24h()
+    # props auto
+    props: List[Prop] = []
+    try:
+        props, _ = polymarket_props_today()
+    except Exception:
+        props = []
+
+    # fallback manual
+    if not props:
+        props = load_props()
+
     if not props:
         return
 
@@ -1002,16 +867,10 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
 
     # pid -> props
     by_pid: Dict[int, List[Prop]] = {}
-    for p in props[:120]:  # cap total props monitoreados por scan
+    for p in props:
         pid = get_pid_for_name(p.player)
         if pid:
             by_pid.setdefault(pid, []).append(p)
-
-    if not by_pid:
-        return
-
-    # Pregame T-90 (1 vez por juego)
-    await pregame_t90_if_needed(context)
 
     # games
     try:
@@ -1020,14 +879,14 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
         return
 
     for g in games:
-        if int(g.get("gameStatus", 0) or 0) != 2:
+        if g.get("gameStatus") != 2:
             continue
 
         gid = g.get("gameId")
         status = g.get("gameStatusText", "")
 
-        home = g.get("homeTeam", {}) or {}
-        away = g.get("awayTeam", {}) or {}
+        home = g.get("homeTeam", {})
+        away = g.get("awayTeam", {})
         try:
             diff = abs(int(home.get("score", 0)) - int(away.get("score", 0)))
         except Exception:
@@ -1052,7 +911,8 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
                 if pid not in by_pid:
                     continue
 
-                s = pl.get("statistics", {}) or {}
+                name = by_pid[pid][0].player
+                s = pl.get("statistics", {})
                 pts = s.get("points", 0) or 0
                 reb = s.get("reboundsTotal", 0) or 0
                 ast = s.get("assists", 0) or 0
@@ -1062,7 +922,6 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
                 for pr in by_pid[pid]:
                     actual = pts if pr.tipo == "puntos" else (reb if pr.tipo == "rebotes" else ast)
 
-                    # PRE score (forma)
                     pre, meta = pre_score(pid, pr.tipo, pr.line, pr.side)
 
                     if pr.side == "over":
@@ -1071,7 +930,7 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
 
                         if not (lo_over <= faltante <= hi_over):
                             continue
-                        if should_gate_by_minutes("over", pr.tipo, faltante, mins, elapsed_min, is_blowout):
+                        if should_gate_by_minutes("over", pr.tipo, mins, elapsed_min, is_blowout):
                             continue
                         if diff >= BLOWOUT_STRONG:
                             if (pr.tipo == "puntos" and faltante > 1.0) or (pr.tipo != "puntos" and faltante > 0.8):
@@ -1083,32 +942,31 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
 
                         if final >= FINAL_ALERT_THRESHOLD or (is_clutch and final >= FINAL_ALERT_THRESHOLD_CLUTCH):
                             if can_send_alert(state, key):
-                                stat = "PTS" if pr.tipo == "puntos" else ("REB" if pr.tipo == "rebotes" else "AST")
                                 msg = (
                                     f"🎯 *ALERTA OVER* | *FINAL* `{final}/100` (LIVE {live} | PRE {pre})\n"
-                                    f"👤 *{pr.player}*\n"
-                                    f"📊 {stat} {actual}/{pr.line} (faltan {faltante:.1f})\n"
+                                    f"👤 *{name}*\n"
+                                    f"📊 {pr.tipo.upper()} {actual}/{pr.line} (faltan {faltante:.1f})\n"
                                     f"⏱️ {status} | Q{period} {game_clock}\n"
                                     f"🧠 MIN {mins:.1f} | PF {pf} | Diff {diff}\n"
                                     f"📈 Forma: hit5 {meta['hits5']}/{meta['n5']} | hit10 {meta['hits10']}/{meta['n10']}\n"
                                 )
                                 await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.MARKDOWN)
 
-                    else:  # UNDER
+                    else:
                         margin_under = float(pr.line) - float(actual)
-                        if should_gate_by_minutes("under", pr.tipo, margin_under, mins, elapsed_min, is_blowout):
+                        if should_gate_by_minutes("under", pr.tipo, mins, elapsed_min, is_blowout):
                             continue
+
                         live = compute_under_score(pr.tipo, margin_under, mins, pf, period, clock_sec, diff, is_clutch, is_blowout)
                         final = int(clamp(0.65 * live + 0.35 * pre, 0, 100))
                         key = f"{gid}|{pid}|{pr.tipo}|{pr.side}|{pr.line}"
 
                         if final >= FINAL_ALERT_THRESHOLD or (is_blowout and final >= FINAL_ALERT_THRESHOLD_CLUTCH):
                             if can_send_alert(state, key):
-                                stat = "PTS" if pr.tipo == "puntos" else ("REB" if pr.tipo == "rebotes" else "AST")
                                 msg = (
                                     f"🧊 *ALERTA UNDER* | *FINAL* `{final}/100` (LIVE {live} | PRE {pre})\n"
-                                    f"👤 *{pr.player}*\n"
-                                    f"📊 {stat} {actual}/{pr.line} (colchón {margin_under:.1f})\n"
+                                    f"👤 *{name}*\n"
+                                    f"📊 {pr.tipo.upper()} {actual}/{pr.line} (colchón {margin_under:.1f})\n"
                                     f"⏱️ {status} | Q{period} {game_clock}\n"
                                     f"🧠 MIN {mins:.1f} | PF {pf} | Diff {diff}\n"
                                     f"📈 Forma: hit5 {meta['hits5']}/{meta['n5']} | hit10 {meta['hits10']}/{meta['n10']}\n"
@@ -1119,16 +977,16 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# Startup / main
+# Main
 # =========================
 async def on_startup(app: Application):
-    log.info("Bot arrancado.")
+    log.info("Bot listo. /start para activar scan background.")
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # /start registers the repeating job for this chat
-    async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # /start registra job + muestra help
+    async def register_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         jobs = context.job_queue.get_jobs_by_name(f"scan:{chat_id}")
         if not jobs:
@@ -1139,12 +997,11 @@ def main():
                 chat_id=chat_id,
                 name=f"scan:{chat_id}",
             )
-            await update.message.reply_text("✅ Background scan activado (cada 120s).")
-        await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(f"✅ Background scan activado (cada {POLL_SECONDS}s).")
+        await cmd_start(update, context)
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("today", cmd_today))
+    app.add_handler(CommandHandler("start", register_job), group=0)
+    app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("odds", cmd_odds))
     app.add_handler(CommandHandler("live", cmd_live))
 
