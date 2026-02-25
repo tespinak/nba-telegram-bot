@@ -4,7 +4,6 @@ import json
 import time
 import math
 import random
-import asyncio
 import logging
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
@@ -159,7 +158,7 @@ def save_props(props: List[Prop]):
 # Player ID cache
 # =========================
 def obtener_id_jugador(nombre: str) -> Optional[int]:
-    time.sleep(0.25 + random.random() * 0.2)
+    time.sleep(0.22 + random.random() * 0.25)
     res = players.find_players_by_full_name(nombre)
     if not res:
         return None
@@ -466,7 +465,7 @@ def compute_under_score(tipo, margin_under, mins, pf, period, clock_seconds, dif
 
 
 # =========================
-# Alert state / cooldown per prop
+# Alert state / cooldown
 # =========================
 def load_alert_state():
     return load_json(ALERTS_STATE_FILE, {})
@@ -484,7 +483,7 @@ def can_send_alert(state: dict, key: str) -> bool:
 
 
 # =========================
-# Pregame helpers (featured + T-90)
+# Pregame helpers
 # =========================
 def load_pregame_state():
     return load_json(PREGAME_STATE_FILE, {})
@@ -530,39 +529,68 @@ def mark_once(st: dict, key: str) -> bool:
 
 
 # =========================
-# Polymarket: universo P/R/A (sin cuotas)
+# Polymarket universe (P/R/A) — FIXED parser
 # =========================
-PAR_LINE_RE = re.compile(
-    r"^(?P<player>.+?)\s+"
-    r"(?P<stat>puntos|rebotes|asistencias|points|rebounds|assists|pts|reb|ast)\b.*?"
-    r"(?:(?:\bO(?:ver)?\s*(?P<o1>\d+(\.\d+)?)\b.*?\bU(?:nder)?\s*(?P<u1>\d+(\.\d+)?)\b)"
-    r"|(?:\bOver\s*(?P<o2>\d+(\.\d+)?)\b.*?\bUnder\s*(?P<u2>\d+(\.\d+)?)\b))",
-    re.IGNORECASE
-)
-
-STAT_MAP = {
-    "points": "puntos", "pts": "puntos", "puntos": "puntos",
-    "rebounds": "rebotes", "reb": "rebotes", "rebotes": "rebotes",
-    "assists": "asistencias", "ast": "asistencias", "asistencias": "asistencias",
-}
-
 def parse_polymarket_ou_title(title: str) -> List[dict]:
-    t = (title or "").strip().replace("•", " ").replace("|", " ")
-    m = PAR_LINE_RE.search(t)
-    if not m:
+    """
+    Soporta:
+      - "Caris LeVert. Puntos. Over 6.5 (53) Under 6.5 (56)"
+      - "Chet Holmgren asistencias O1.5 U1.5"
+      - "Duncan Robinson Rebotes o2.5 u2.5"
+      - con puntos/guiones/pipe/paréntesis
+    Devuelve 2 props (over/under) con la misma línea.
+    """
+    if not title:
         return []
 
-    player = (m.group("player") or "").strip().strip(".").title()
-    stat_raw = (m.group("stat") or "").lower().strip()
-    tipo = STAT_MAP.get(stat_raw)
-    if not player or not tipo:
+    t = str(title).strip()
+    low = t.lower()
+
+    # tipo
+    tipo = None
+    if re.search(r"\b(puntos|points|pts)\b", low):
+        tipo = "puntos"
+    elif re.search(r"\b(rebotes|rebounds|reb)\b", low):
+        tipo = "rebotes"
+    elif re.search(r"\b(asistencias|assists|ast)\b", low):
+        tipo = "asistencias"
+    else:
         return []
 
-    line_s = m.group("o1") or m.group("o2")
-    if not line_s:
+    # línea desde O/U u Over/Under (toma la primera que encuentre)
+    mo = re.search(r"\b(o(?:ver)?)\s*([0-9]+(?:\.[0-9]+)?)\b", low)
+    mu = re.search(r"\b(u(?:nder)?)\s*([0-9]+(?:\.[0-9]+)?)\b", low)
+    if not mo and not mu:
         return []
 
-    line = float(line_s)
+    line_s = (mo.group(2) if mo else None) or (mu.group(2) if mu else None)
+    try:
+        line = float(line_s)
+    except Exception:
+        return []
+
+    # nombre jugador: texto antes del keyword de stat
+    stat_pos = None
+    for kw in ["puntos", "points", "pts", "rebotes", "rebounds", "reb", "asistencias", "assists", "ast"]:
+        p = low.find(kw)
+        if p != -1:
+            stat_pos = p
+            break
+
+    head = t[:stat_pos].strip() if stat_pos is not None else t
+    head = re.sub(r"[\|\-–—•]+", " ", head).strip()
+    head = re.sub(r"\s+", " ", head).strip()
+    head = head.strip(" .")
+
+    # heurística ligera por si viene con frases
+    head = re.sub(r"^(will|does|can|is|are)\s+", "", head, flags=re.IGNORECASE).strip()
+
+    player = head.strip(" .")
+    if not player or len(player) < 3:
+        return []
+
+    # Title case suave
+    player = " ".join([w.capitalize() for w in player.split()])
 
     return [
         {"player": player, "tipo": tipo, "side": "over", "line": line},
@@ -587,17 +615,12 @@ def build_polymarket_universe_par(limit_events: int = 250) -> List[dict]:
     universe = []
 
     for ev in events:
-        title_ev = (ev.get("title") or "").lower()
-        if "nba" not in title_ev:
-            continue
-
         markets = ev.get("markets") or []
         for m in markets:
             q = m.get("question") or m.get("title") or ""
             low = q.lower()
             if not any(k in low for k in ["puntos", "rebotes", "asistencias", "points", "rebounds", "assists", "pts", "reb", "ast"]):
                 continue
-
             props = parse_polymarket_ou_title(q)
             if props:
                 universe.extend(props)
@@ -621,7 +644,7 @@ HELP_TEXT = (
     "Comandos:\n"
     "• `/today` → programación NBA de hoy\n"
     "• `/odds`  → props P/R/A de Polymarket (sin cuotas)\n"
-    "• `/live`  → estado en vivo de tus props (si cargaste props.json)\n\n"
+    "• `/live`  → estado en vivo (usa Polymarket si no tienes props.json)\n\n"
     "Opcional:\n"
     "• `/add Nombre | tipo | side | linea`\n"
     "   Ej: `/add Nikola Jokic | asistencias | under | 9.5`\n"
@@ -717,43 +740,59 @@ async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if not props:
-        await update.message.reply_text(
-            "No pude parsear props P/R/A desde Polymarket.\n"
-            "Si me pegas 2-3 títulos exactos, ajusto el parser en 1 minuto."
-        )
+        await update.message.reply_text("No pude parsear props P/R/A desde Polymarket (0 encontrados).")
         return
 
-    lines = ["🟣 *Polymarket — Props P/R/A (sin cuotas)*"]
+    lines = [f"🟣 *Polymarket — Props P/R/A (sin cuotas)* | encontrados: `{len(props)}`"]
     for p in props[:35]:
         lines.append(f"• {p['player']} — {p['tipo']} {p['side'].upper()} {p['line']}")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
-async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _props_source_auto() -> List[Prop]:
+    """Si props.json está vacío, usamos universo Polymarket automáticamente."""
     props = load_props()
+    if props:
+        return props
+    try:
+        pm = build_polymarket_universe_par(limit_events=250)
+        return [Prop(player=p["player"], tipo=p["tipo"], side=p["side"], line=float(p["line"])) for p in pm]
+    except Exception:
+        return []
+
+async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    props = _props_source_auto()
     if not props:
-        await update.message.reply_text("No hay props cargados en props.json. (Este comando es para props manuales).")
+        await update.message.reply_text("No pude cargar props (ni props.json ni Polymarket).")
         return
 
-    by_player: Dict[str, List[Prop]] = {}
-    for p in props:
-        by_player.setdefault(p.player, []).append(p)
-
+    # solo juegos live
     try:
         games = scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"]
     except Exception as e:
         await update.message.reply_text(f"⚠️ No pude leer scoreboard: {e}")
         return
 
-    pid_map: Dict[int, str] = {}
-    for name in by_player.keys():
-        pid = get_pid_for_name(name)
+    live_games = [g for g in games if int(g.get("gameStatus", 0) or 0) == 2]
+    if not live_games:
+        await update.message.reply_text("No hay partidos en vivo ahora mismo.")
+        return
+
+    # index props por pid
+    by_pid: Dict[int, List[Prop]] = {}
+    for p in props:
+        pid = get_pid_for_name(p.player)
         if pid:
-            pid_map[pid] = name
+            by_pid.setdefault(pid, []).append(p)
+
+    if not by_pid:
+        await update.message.reply_text("No pude resolver IDs de jugadores para tus props.")
+        return
 
     out = []
-    for g in games:
-        if g.get("gameStatus") != 2:
-            continue
+    shown_players = 0
+    MAX_PLAYERS = 10  # para no spamear Telegram (sube si quieres)
+
+    for g in live_games:
         gid = g.get("gameId")
         status = g.get("gameStatusText", "")
         period = int(g.get("period", 0) or 0)
@@ -767,21 +806,23 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for team_key in ["homeTeam", "awayTeam"]:
             for pl in box.get(team_key, {}).get("players", []):
                 pid = pl.get("personId")
-                if pid not in pid_map:
+                if pid not in by_pid:
                     continue
-                name = pid_map[pid]
+
                 stats = pl.get("statistics", {})
                 pts = stats.get("points", 0) or 0
                 reb = stats.get("reboundsTotal", 0) or 0
                 ast = stats.get("assists", 0) or 0
                 mins = parse_minutes(stats.get("minutes", ""))
 
-                ps = by_player.get(name, [])
-                if not ps:
-                    continue
-
+                name = by_pid[pid][0].player
                 out.append(f"🏀 *{name}* — {status} (Q{period} {clock}) | MIN {mins:.1f}")
-                for pr in ps:
+
+                # ordena: puntos, rebotes, asistencias
+                order = {"puntos": 0, "rebotes": 1, "asistencias": 2}
+                ps = sorted(by_pid[pid], key=lambda x: order.get(x.tipo, 99))
+
+                for pr in ps[:6]:
                     actual = pts if pr.tipo == "puntos" else (reb if pr.tipo == "rebotes" else ast)
                     if pr.side == "over":
                         need = pr.line - actual
@@ -789,10 +830,18 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         cushion = pr.line - actual
                         out.append(f"  • {pr.tipo} UNDER {pr.line}: {actual} (colchón {cushion:.1f})")
+
                 out.append("")
+                shown_players += 1
+                if shown_players >= MAX_PLAYERS:
+                    break
+            if shown_players >= MAX_PLAYERS:
+                break
+        if shown_players >= MAX_PLAYERS:
+            break
 
     if not out:
-        await update.message.reply_text("No hay partidos en vivo o ninguno de tus jugadores está jugando ahora.")
+        await update.message.reply_text("Hay partidos en vivo, pero ninguno coincide con el universo de props/jugadores.")
         return
 
     msg = "\n".join(out)
@@ -826,7 +875,6 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
         upcoming.append((m, g))
     upcoming.sort(key=lambda x: x[0])
 
-    # Partido destacado (una vez al día por juego)
     if upcoming:
         m, g0 = upcoming[0]
         gid0 = g0.get("gameId")
@@ -845,7 +893,6 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
                     parse_mode=ParseMode.MARKDOWN
                 )
 
-    # T-90 (±6 min)
     for m, g in upcoming:
         if not (84 <= m <= 96):
             continue
@@ -868,22 +915,13 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
 
     save_pregame_state(pre)
 
-    # --- Props fuente: props.json o universo Polymarket ---
-    props = load_props()
-    if not props:
-        # modo automático: Polymarket
-        try:
-            pm = build_polymarket_universe_par(limit_events=250)
-            props = [Prop(player=p["player"], tipo=p["tipo"], side=p["side"], line=float(p["line"])) for p in pm]
-        except Exception:
-            return
-
+    # --- Props fuente (auto) ---
+    props = _props_source_auto()
     if not props:
         return
 
     state = load_alert_state()
 
-    # pid -> props
     by_pid: Dict[int, List[Prop]] = {}
     for p in props:
         pid = get_pid_for_name(p.player)
@@ -935,7 +973,6 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
                 for pr in by_pid[pid]:
                     actual = pts if pr.tipo == "puntos" else (reb if pr.tipo == "rebotes" else ast)
 
-                    # PRE
                     pre_sc, meta = pre_score(pid, pr.tipo, pr.line, pr.side)
 
                     if pr.side == "over":
@@ -1017,8 +1054,8 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("odds", cmd_odds))
-    app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("live", cmd_live))
+    app.add_handler(CommandHandler("add", cmd_add))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
