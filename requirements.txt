@@ -1,4 +1,4 @@
-python-telegram-bot==20.7
-nba_api==1.4.1
+python-telegram-bot==21.6
+nba_api==1.6.1
 requests==2.32.3
 urllib3==2.2.2
