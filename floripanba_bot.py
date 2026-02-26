@@ -31,7 +31,6 @@ from nba_api.stats.static import players
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("nba-bot")
 
-# ✅ SIEMPRE por variable de entorno (Railway Variables)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 if not TELEGRAM_TOKEN:
     raise RuntimeError("Missing TELEGRAM_TOKEN env var")
@@ -43,29 +42,25 @@ ALERTS_STATE_FILE = "alerts_state.json"
 IDS_CACHE_FILE = "player_ids_cache.json"
 GLOG_CACHE_FILE = "gamelog_cache.json"
 
-SEASON = os.environ.get("NBA_SEASON", "2025-26")  # ajusta cuando cambie
+SEASON = os.environ.get("NBA_SEASON", "2025-26")
 
-# thresholds / scoring
 FINAL_ALERT_THRESHOLD = 75
 FINAL_ALERT_THRESHOLD_CLUTCH = 68
 
-COOLDOWN_SECONDS = 8 * 60  # anti spam por prop
+COOLDOWN_SECONDS = 8 * 60
 BLOWOUT_IS = 20
 BLOWOUT_STRONG = 22
 
-# Para estar "cerca" de la línea
 THRESH_POINTS_OVER = (0.5, 4.0)
 THRESH_REB_AST_OVER = (0.5, 1.5)
 
 MIN_MINUTES_POINTS = 10.0
 MIN_MINUTES_REB_AST = 14.0
 
-# PRE score caps
 STAT_COL = {"puntos": "PTS", "rebotes": "REB", "asistencias": "AST"}
 STD_CAP = {"puntos": 8.0, "rebotes": 4.0, "asistencias": 3.0}
 MARGIN_CAP = {"puntos": 8.0, "rebotes": 3.0, "asistencias": 3.0}
 
-# Polymarket Gamma API
 GAMMA = "https://gamma-api.polymarket.com"
 
 # =========================
@@ -143,7 +138,7 @@ class Prop:
     tipo: str                # "puntos" | "rebotes" | "asistencias"
     line: float
     side: str                # "over" | "under"
-    source: str = "manual"   # manual | polymarket | fallback
+    source: str = "manual"
     game_slug: Optional[str] = None
     market_id: Optional[str] = None
     added_by: Optional[int] = None
@@ -191,9 +186,9 @@ def get_pid_for_name(name: str) -> Optional[int]:
     return pid
 
 # =========================
-# Gamelog cache + fetch (stats.nba.com)
+# Gamelog cache + fetch
 # =========================
-GLOG_TTL_SECONDS = 6 * 60 * 60  # 6h
+GLOG_TTL_SECONDS = 6 * 60 * 60
 
 def load_glog_cache():
     return load_json(GLOG_CACHE_FILE, {})
@@ -488,18 +483,52 @@ def can_send_alert(state: dict, key: str) -> bool:
     return False
 
 # =========================
-# Polymarket: parse props P/R/A desde event slug
+# Polymarket — helpers de matching
 # =========================
 PM_CACHE = {"ts": 0, "date": None, "props": []}
 PM_TTL_SECONDS = 8 * 60
 
 _TIPO_MAP = {"points": "puntos", "rebounds": "rebotes", "assists": "asistencias"}
 
-# Ej: "Isaiah Hartenstein: Assists O/U 3.5"
+# Regex: "Isaiah Hartenstein: Assists O/U 3.5"  OR  "Player Name Points O/U 22.5"
 _PM_Q_RE = re.compile(
-    r"^(?P<player>.+?):\s*(?P<stat>Points|Rebounds|Assists)\s*O\/U\s*(?P<line>\d+(?:\.\d+)?)",
+    r"^(?P<player>.+?)(?::\s*|\s+)(?P<stat>Points|Rebounds|Assists)\s*O\/U\s*(?P<line>\d+(?:\.\d+)?)",
     re.IGNORECASE,
 )
+
+# Mapa tricode NBA → nombres posibles en slugs de Polymarket
+_TRICODE_TO_SLUG_NAMES = {
+    "ATL": ["atlanta", "hawks", "atl"],
+    "BOS": ["boston", "celtics", "bos"],
+    "BKN": ["brooklyn", "nets", "bkn", "bk"],
+    "CHA": ["charlotte", "hornets", "cha"],
+    "CHI": ["chicago", "bulls", "chi"],
+    "CLE": ["cleveland", "cavaliers", "cavs", "cle"],
+    "DAL": ["dallas", "mavericks", "mavs", "dal"],
+    "DEN": ["denver", "nuggets", "den"],
+    "DET": ["detroit", "pistons", "det"],
+    "GSW": ["golden-state", "golden_state", "warriors", "gsw", "gs"],
+    "HOU": ["houston", "rockets", "hou"],
+    "IND": ["indiana", "pacers", "ind"],
+    "LAC": ["la-clippers", "clippers", "lac"],
+    "LAL": ["la-lakers", "lakers", "lal", "la"],
+    "MEM": ["memphis", "grizzlies", "mem"],
+    "MIA": ["miami", "heat", "mia"],
+    "MIL": ["milwaukee", "bucks", "mil"],
+    "MIN": ["minnesota", "timberwolves", "wolves", "min"],
+    "NOP": ["new-orleans", "pelicans", "nop", "no"],
+    "NYK": ["new-york", "knicks", "nyk", "ny"],
+    "OKC": ["oklahoma", "thunder", "okc"],
+    "ORL": ["orlando", "magic", "orl"],
+    "PHI": ["philadelphia", "76ers", "sixers", "phi"],
+    "PHX": ["phoenix", "suns", "phx", "phx"],
+    "POR": ["portland", "trail-blazers", "blazers", "por"],
+    "SAC": ["sacramento", "kings", "sac"],
+    "SAS": ["san-antonio", "spurs", "sas", "sa"],
+    "TOR": ["toronto", "raptors", "tor"],
+    "UTA": ["utah", "jazz", "uta"],
+    "WAS": ["washington", "wizards", "was"],
+}
 
 def _slug_from_scoreboard_game(g: dict) -> str:
     away = (g.get("awayTeam", {}) or {}).get("teamTricode", "").lower()
@@ -507,54 +536,201 @@ def _slug_from_scoreboard_game(g: dict) -> str:
     d = date.today().isoformat()
     return f"nba-{away}-{home}-{d}"
 
+def _event_matches_game(ev_slug: str, ev_title: str, away_tri: str, home_tri: str) -> bool:
+    """Verifica si un evento de Polymarket corresponde a un partido NBA específico."""
+    slug_l = ev_slug.lower()
+    title_l = ev_title.lower()
+    combined = slug_l + " " + title_l
+
+    away_names = _TRICODE_TO_SLUG_NAMES.get(away_tri.upper(), [away_tri.lower()])
+    home_names = _TRICODE_TO_SLUG_NAMES.get(home_tri.upper(), [home_tri.lower()])
+
+    away_found = any(name in combined for name in away_names)
+    home_found = any(name in combined for name in home_names)
+
+    return away_found and home_found
+
+def polymarket_fetch_all_nba_events() -> List[dict]:
+    """Obtiene todos los eventos NBA activos de Polymarket usando paginación."""
+    all_events = []
+    limit = 100
+    offset = 0
+
+    # Intentamos varios tag slugs que Polymarket puede usar para NBA
+    tag_slugs = ["nba", "basketball", "sports"]
+
+    for tag in tag_slugs:
+        offset = 0
+        while True:
+            url = f"{GAMMA}/events"
+            params = {
+                "tag_slug": tag,
+                "closed": "false",
+                "limit": limit,
+                "offset": offset,
+            }
+            try:
+                r = SESSION_PM.get(url, params=params, timeout=25)
+                log.info(f"Polymarket /events tag={tag} offset={offset} → status {r.status_code}")
+                if r.status_code != 200:
+                    break
+
+                data = r.json()
+                events = data if isinstance(data, list) else data.get("events", [])
+
+                if not events:
+                    break
+
+                all_events.extend(events)
+                log.info(f"  → {len(events)} eventos (total acumulado: {len(all_events)})")
+
+                if len(events) < limit:
+                    break
+                offset += limit
+
+            except Exception as e:
+                log.warning(f"Error fetching Polymarket events tag={tag}: {e}")
+                break
+
+        # Si ya encontramos eventos con nba, no seguimos
+        if all_events:
+            break
+
+    # Dedupe por id
+    seen_ids = set()
+    unique = []
+    for ev in all_events:
+        eid = ev.get("id") or ev.get("slug")
+        if eid not in seen_ids:
+            seen_ids.add(eid)
+            unique.append(ev)
+
+    log.info(f"Total eventos únicos Polymarket: {len(unique)}")
+    return unique
+
 def polymarket_event_by_slug(slug: str) -> Optional[dict]:
     url = f"{GAMMA}/events/slug/{slug}"
     try:
         r = SESSION_PM.get(url, timeout=20)
+        log.info(f"Polymarket slug lookup '{slug}' → status {r.status_code}")
         if r.status_code != 200:
             return None
         return r.json()
-    except Exception:
+    except Exception as e:
+        log.warning(f"polymarket_event_by_slug error: {e}")
         return None
 
-def polymarket_props_from_event(event_json: dict) -> List[Prop]:
+def polymarket_event_markets(event_id: str) -> List[dict]:
+    """Obtiene markets de un evento específico por ID."""
+    url = f"{GAMMA}/markets"
+    params = {"event_id": event_id, "limit": 200}
+    try:
+        r = SESSION_PM.get(url, params=params, timeout=20)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        return data if isinstance(data, list) else data.get("markets", [])
+    except Exception as e:
+        log.warning(f"polymarket_event_markets error: {e}")
+        return []
+
+def _parse_player_stat_from_market(m: dict) -> Tuple[Optional[str], Optional[str], Optional[float]]:
+    """
+    Extrae (player, stat_type, line) de un market de Polymarket.
+    Retorna (None, None, None) si no aplica.
+    """
+    # Intentamos sportsMarketType primero
+    smt = (m.get("sportsMarketType") or m.get("sport_market_type") or "").lower()
+
+    # Si no hay sportsMarketType, intentamos inferir del título/pregunta
+    q = (m.get("question") or m.get("title") or "").strip()
+
+    if not smt:
+        q_lower = q.lower()
+        if "point" in q_lower:
+            smt = "points"
+        elif "rebound" in q_lower:
+            smt = "rebounds"
+        elif "assist" in q_lower:
+            smt = "assists"
+
+    if smt not in ("points", "rebounds", "assists"):
+        return None, None, None
+
+    # Intentamos parsear línea y jugador del campo "line"
+    line_raw = m.get("line", None)
+    player = None
+    line_val = None
+
+    # Caso 1: tiene campo "line" numérico
+    if line_raw is not None:
+        try:
+            line_val = float(line_raw)
+        except Exception:
+            pass
+
+    # Intentamos extraer jugador y línea de la pregunta
+    mm = _PM_Q_RE.match(q)
+    if mm:
+        player = mm.group("player").strip()
+        if line_val is None:
+            try:
+                line_val = float(mm.group("line"))
+            except Exception:
+                pass
+
+    # Si no encontramos jugador con el regex, intentamos groupItemTitle
+    if not player:
+        git = (m.get("groupItemTitle") or m.get("group_item_title") or "").strip()
+        if git:
+            # groupItemTitle suele ser el nombre del jugador directamente
+            player = git
+
+    if not player or line_val is None:
+        return None, None, None
+
+    return player, smt, line_val
+
+def polymarket_props_from_event(event_json: dict, fallback_slug: str = "") -> List[Prop]:
     out: List[Prop] = []
+    event_slug = event_json.get("slug") or fallback_slug or str(event_json.get("id", "unknown"))
+
+    # Los markets pueden estar embebidos en el evento o hay que buscarlos
     markets = event_json.get("markets", []) or []
-    event_slug = event_json.get("slug")
+
+    # Si el evento no tiene markets embebidos, los buscamos por event_id
+    if not markets and event_json.get("id"):
+        markets = polymarket_event_markets(str(event_json["id"]))
+
+    log.info(f"Evento '{event_slug}': {len(markets)} markets a procesar")
 
     for m in markets:
-        smt = (m.get("sportsMarketType") or "").lower()
-        if smt not in ("points", "rebounds", "assists"):
+        player, smt, line_val = _parse_player_stat_from_market(m)
+        if not player or not smt or line_val is None:
             continue
 
-        q = (m.get("question") or "").strip()
-        line = m.get("line", None)
-
-        player = None
-        parsed_line = None
-
-        mm = _PM_Q_RE.match(q)
-        if mm:
-            player = mm.group("player").strip()
-            parsed_line = float(mm.group("line"))
-
-        if line is None and parsed_line is None:
-            continue
-
-        line_val = float(line if line is not None else parsed_line)
-        market_id = str(m.get("id") or "")
         tipo = _TIPO_MAP.get(smt)
-        if not tipo or not player:
+        if not tipo:
             continue
 
-        out.append(Prop(player=player, tipo=tipo, side="over", line=line_val, source="polymarket",
-                        game_slug=event_slug, market_id=market_id))
-        out.append(Prop(player=player, tipo=tipo, side="under", line=line_val, source="polymarket",
-                        game_slug=event_slug, market_id=market_id))
+        market_id = str(m.get("id") or "")
+
+        out.append(Prop(
+            player=player, tipo=tipo, side="over", line=line_val,
+            source="polymarket", game_slug=event_slug, market_id=market_id
+        ))
+        out.append(Prop(
+            player=player, tipo=tipo, side="under", line=line_val,
+            source="polymarket", game_slug=event_slug, market_id=market_id
+        ))
+
     return out
 
-# ---- FALLBACK MANUAL (si Gamma falla) ----
-_FALLBACK_DATE = "2026-02-25"
+# =========================
+# FALLBACK PROPS (hoy: 2026-02-25)
+# =========================
+_FALLBACK_DATE = date.today().isoformat()   # Siempre activo como último recurso
+
 FALLBACK_PROPS: List[Prop] = [
     # BOS @ DEN
     Prop("Jaylen Brown", "puntos", 28.5, "over", source="fallback", game_slug="nba-bos-den-2026-02-25"),
@@ -567,7 +743,6 @@ FALLBACK_PROPS: List[Prop] = [
     Prop("Payton Pritchard", "puntos", 18.5, "under", source="fallback", game_slug="nba-bos-den-2026-02-25"),
     Prop("Derrick White", "puntos", 17.5, "over", source="fallback", game_slug="nba-bos-den-2026-02-25"),
     Prop("Derrick White", "puntos", 17.5, "under", source="fallback", game_slug="nba-bos-den-2026-02-25"),
-
     # CLE @ MIL
     Prop("Donovan Mitchell", "puntos", 26.5, "over", source="fallback", game_slug="nba-cle-mil-2026-02-25"),
     Prop("Donovan Mitchell", "puntos", 26.5, "under", source="fallback", game_slug="nba-cle-mil-2026-02-25"),
@@ -579,7 +754,6 @@ FALLBACK_PROPS: List[Prop] = [
     Prop("Sam Merrill", "puntos", 11.5, "under", source="fallback", game_slug="nba-cle-mil-2026-02-25"),
     Prop("Jaylon Tyson", "puntos", 11.5, "over", source="fallback", game_slug="nba-cle-mil-2026-02-25"),
     Prop("Jaylon Tyson", "puntos", 11.5, "under", source="fallback", game_slug="nba-cle-mil-2026-02-25"),
-
     # GSW @ MEM
     Prop("Al Horford", "rebotes", 6.5, "over", source="fallback", game_slug="nba-gsw-mem-2026-02-25"),
     Prop("Al Horford", "rebotes", 6.5, "under", source="fallback", game_slug="nba-gsw-mem-2026-02-25"),
@@ -591,7 +765,6 @@ FALLBACK_PROPS: List[Prop] = [
     Prop("Ty Jerome", "puntos", 16.5, "under", source="fallback", game_slug="nba-gsw-mem-2026-02-25"),
     Prop("GG Jackson II", "puntos", 14.5, "over", source="fallback", game_slug="nba-gsw-mem-2026-02-25"),
     Prop("GG Jackson II", "puntos", 14.5, "under", source="fallback", game_slug="nba-gsw-mem-2026-02-25"),
-
     # OKC @ DET
     Prop("Isaiah Hartenstein", "asistencias", 3.5, "over", source="fallback", game_slug="nba-okc-det-2026-02-25"),
     Prop("Isaiah Hartenstein", "asistencias", 3.5, "under", source="fallback", game_slug="nba-okc-det-2026-02-25"),
@@ -603,7 +776,6 @@ FALLBACK_PROPS: List[Prop] = [
     Prop("Isaiah Joe", "puntos", 14.5, "under", source="fallback", game_slug="nba-okc-det-2026-02-25"),
     Prop("Cason Wallace", "puntos", 11.5, "over", source="fallback", game_slug="nba-okc-det-2026-02-25"),
     Prop("Cason Wallace", "puntos", 11.5, "under", source="fallback", game_slug="nba-okc-det-2026-02-25"),
-
     # SAC @ HOU
     Prop("Tari Eason", "rebotes", 7.5, "over", source="fallback", game_slug="nba-sac-hou-2026-02-25"),
     Prop("Tari Eason", "rebotes", 7.5, "under", source="fallback", game_slug="nba-sac-hou-2026-02-25"),
@@ -615,7 +787,6 @@ FALLBACK_PROPS: List[Prop] = [
     Prop("Keegan Murray", "rebotes", 5.5, "under", source="fallback", game_slug="nba-sac-hou-2026-02-25"),
     Prop("Dorian Finney-Smith", "rebotes", 3.5, "over", source="fallback", game_slug="nba-sac-hou-2026-02-25"),
     Prop("Dorian Finney-Smith", "rebotes", 3.5, "under", source="fallback", game_slug="nba-sac-hou-2026-02-25"),
-
     # SAS @ TOR
     Prop("Scottie Barnes", "asistencias", 4.5, "over", source="fallback", game_slug="nba-sas-tor-2026-02-25"),
     Prop("Scottie Barnes", "asistencias", 4.5, "under", source="fallback", game_slug="nba-sas-tor-2026-02-25"),
@@ -629,49 +800,119 @@ FALLBACK_PROPS: List[Prop] = [
     Prop("Scottie Barnes", "rebotes", 8.5, "under", source="fallback", game_slug="nba-sas-tor-2026-02-25"),
 ]
 
-def fallback_props_if_needed() -> List[Prop]:
-    # Solo para el día que nos pasaste (evita contaminar otros días).
-    if date.today().isoformat() == _FALLBACK_DATE:
-        return FALLBACK_PROPS
-    return []
-
+# =========================
+# Polymarket: función principal de carga
+# =========================
 def polymarket_props_today_from_scoreboard() -> List[Prop]:
     today = date.today().isoformat()
     now = now_ts()
 
     if PM_CACHE["date"] == today and (now - PM_CACHE["ts"]) < PM_TTL_SECONDS:
+        log.info(f"PM_CACHE hit: {len(PM_CACHE['props'])} props")
         return PM_CACHE["props"]
 
+    # Obtener partidos NBA de hoy
     try:
         games = scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"]
-    except Exception:
+    except Exception as e:
+        log.warning(f"Scoreboard error: {e}")
         games = []
 
-    props_all: List[Prop] = []
-    for g in games:
-        slug = _slug_from_scoreboard_game(g)
-        ev = polymarket_event_by_slug(slug)
-        if not ev:
-            continue
-        props_all.extend(polymarket_props_from_event(ev))
+    if not games:
+        log.warning("No hay partidos en el scoreboard de hoy")
 
-    # dedupe
+    # Construir pares de tricodes para matching
+    team_pairs = []
+    for g in games:
+        away_tri = (g.get("awayTeam", {}) or {}).get("teamTricode", "").upper()
+        home_tri = (g.get("homeTeam", {}) or {}).get("teamTricode", "").upper()
+        local_slug = _slug_from_scoreboard_game(g)
+        if away_tri and home_tri:
+            team_pairs.append((away_tri, home_tri, local_slug))
+
+    log.info(f"Partidos hoy: {team_pairs}")
+
+    props_all: List[Prop] = []
+
+    # === ESTRATEGIA 1: Buscar por slug exacto ===
+    for away_tri, home_tri, local_slug in team_pairs:
+        ev = polymarket_event_by_slug(local_slug)
+        if ev:
+            log.info(f"✅ Slug exacto encontrado: {local_slug}")
+            new_props = polymarket_props_from_event(ev, fallback_slug=local_slug)
+            log.info(f"   → {len(new_props)//2} props de jugadores")
+            props_all.extend(new_props)
+
+    # === ESTRATEGIA 2: Buscar todos los eventos NBA y hacer matching por nombre ===
+    if not props_all:
+        log.info("Slug exacto falló, buscando por matching de nombres de equipos...")
+        all_events = polymarket_fetch_all_nba_events()
+
+        for ev in all_events:
+            ev_slug = (ev.get("slug") or "").lower()
+            ev_title = (ev.get("title") or ev.get("name") or "").lower()
+
+            # Solo eventos de hoy (fecha en slug o titulo)
+            today_short = today.replace("-", "")
+            date_in_slug = today in ev_slug or today_short in ev_slug
+
+            matched_local_slug = None
+            for away_tri, home_tri, local_slug in team_pairs:
+                if _event_matches_game(ev_slug, ev_title, away_tri, home_tri):
+                    matched_local_slug = local_slug
+                    log.info(f"✅ Match por nombre: '{ev_slug}' → {local_slug}")
+                    break
+
+            if not matched_local_slug:
+                continue
+
+            new_props = polymarket_props_from_event(ev, fallback_slug=matched_local_slug)
+            log.info(f"   → {len(new_props)//2} props")
+            props_all.extend(new_props)
+
+    # === ESTRATEGIA 3: Buscar slugs alternativos para cada partido ===
+    if not props_all:
+        log.info("Probando slugs alternativos...")
+        for away_tri, home_tri, local_slug in team_pairs:
+            away_names = _TRICODE_TO_SLUG_NAMES.get(away_tri, [away_tri.lower()])
+            home_names = _TRICODE_TO_SLUG_NAMES.get(home_tri, [home_tri.lower()])
+
+            slug_candidates = []
+            for an in away_names[:2]:
+                for hn in home_names[:2]:
+                    for separator in ["-", "_", ""]:
+                        for prefix in ["nba-", ""]:
+                            slug_candidates.append(f"{prefix}{an}{separator}{hn}{separator}{today}")
+                            slug_candidates.append(f"{prefix}{an}{separator}vs{separator}{hn}{separator}{today}")
+                            slug_candidates.append(f"{prefix}{an}{separator}at{separator}{hn}{separator}{today}")
+
+            for slug_try in slug_candidates[:20]:  # límite para no abusar
+                ev = polymarket_event_by_slug(slug_try)
+                if ev:
+                    log.info(f"✅ Slug alternativo encontrado: {slug_try}")
+                    new_props = polymarket_props_from_event(ev, fallback_slug=local_slug)
+                    props_all.extend(new_props)
+                    break
+                time.sleep(0.1)
+
+    # Dedupe
     seen = set()
     uniq = []
     for p in props_all:
         k = (p.game_slug, p.player.lower(), p.tipo, p.side, float(p.line))
-        if k in seen:
-            continue
-        seen.add(k)
-        uniq.append(p)
+        if k not in seen:
+            seen.add(k)
+            uniq.append(p)
 
-    # fallback si Gamma devolvió 0
+    # === FALLBACK FINAL: props hardcodeados ===
     if not uniq:
-        uniq = fallback_props_if_needed()
+        log.warning("⚠️  Sin props de Polymarket — usando fallback hardcodeado")
+        uniq = list(FALLBACK_PROPS)
 
     PM_CACHE["date"] = today
     PM_CACHE["ts"] = now
     PM_CACHE["props"] = uniq
+    log.info(f"Props cargados: {len(uniq)} ({len(uniq)//2} jugadores/lineas)")
     return uniq
 
 # =========================
@@ -685,7 +926,8 @@ HELP_TEXT = (
     "• `/odds`   → props P/R/A de Polymarket (auto)\n"
     "   - `/odds nba-okc-det-2026-02-25`  (solo ese partido)\n"
     "   - `/odds Nikola Jokic`           (filtra por jugador)\n"
-    "• `/live`   → top props en vivo (auto) + scoring\n\n"
+    "• `/live`   → top props en vivo (auto) + scoring\n"
+    "• `/debug`  → info de debug de Polymarket\n\n"
     "Opcional manual:\n"
     "• `/add Nombre | tipo | side | linea`\n"
     "   Ej: `/add Jalen Duren | puntos | over | 15.5`\n"
@@ -774,10 +1016,65 @@ async def cmd_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = msg[:3800] + "\n…(recortado)"
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando de debug para ver qué está pasando con Polymarket."""
+    lines = ["🔍 *DEBUG Polymarket*\n"]
+
+    # Partidos de hoy
+    try:
+        games = scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"]
+        lines.append(f"📅 Partidos NBA hoy: {len(games)}")
+        for g in games:
+            slug = _slug_from_scoreboard_game(g)
+            lines.append(f"  • `{slug}`")
+    except Exception as e:
+        lines.append(f"❌ Error scoreboard: {e}")
+        games = []
+
+    # Test slug exacto con el primer partido
+    if games:
+        test_slug = _slug_from_scoreboard_game(games[0])
+        lines.append(f"\n🔗 Test slug exacto: `{test_slug}`")
+        ev = polymarket_event_by_slug(test_slug)
+        if ev:
+            mkt_count = len(ev.get("markets", []) or [])
+            lines.append(f"  ✅ Encontrado! {mkt_count} markets")
+        else:
+            lines.append(f"  ❌ No encontrado en Polymarket")
+
+    # Test búsqueda general
+    lines.append(f"\n🌐 Buscando eventos NBA en Polymarket...")
+    try:
+        url = f"{GAMMA}/events"
+        r = SESSION_PM.get(url, params={"tag_slug": "nba", "closed": "false", "limit": 5}, timeout=15)
+        lines.append(f"  Status: {r.status_code}")
+        if r.status_code == 200:
+            data = r.json()
+            evs = data if isinstance(data, list) else data.get("events", [])
+            lines.append(f"  Eventos encontrados: {len(evs)}")
+            for ev in evs[:3]:
+                lines.append(f"  • `{ev.get('slug', 'sin-slug')}`")
+        else:
+            lines.append(f"  Body: {r.text[:200]}")
+    except Exception as e:
+        lines.append(f"  ❌ Error: {e}")
+
+    # Props cargados en cache
+    props = PM_CACHE.get("props", [])
+    lines.append(f"\n📦 Props en cache: {len(props)}")
+    if props:
+        fuentes = {}
+        for p in props:
+            fuentes[p.source] = fuentes.get(p.source, 0) + 1
+        for src, cnt in fuentes.items():
+            lines.append(f"  • {src}: {cnt}")
+
+    msg = "\n".join(lines)
+    if len(msg) > 3800:
+        msg = msg[:3800] + "\n…"
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
 def _group_props_pretty(props_pm: List[Prop]) -> Dict[str, Dict[str, Dict[Tuple[str, float], Dict[str, bool]]]]:
-    """
-    game_slug -> player -> (tipo,line) -> {"over":bool,"under":bool}
-    """
     out: Dict[str, Dict[str, Dict[Tuple[str, float], Dict[str, bool]]]] = {}
     for p in props_pm:
         slug = p.game_slug or "unknown"
@@ -790,9 +1087,16 @@ def _group_props_pretty(props_pm: List[Prop]) -> Dict[str, Dict[str, Dict[Tuple[
     return out
 
 async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Cargando props de Polymarket...", parse_mode=ParseMode.MARKDOWN)
+
     props_pm = polymarket_props_today_from_scoreboard()
     if not props_pm:
-        await update.message.reply_text("No pude parsear props P/R/A desde Polymarket (0 encontrados).")
+        await update.message.reply_text(
+            "❌ No pude obtener props de Polymarket ni del fallback.\n"
+            "Usa `/debug` para ver qué está pasando.\n"
+            "O agrega props manualmente con `/add`.",
+            parse_mode=ParseMode.MARKDOWN
+        )
         return
 
     args = context.args or []
@@ -806,29 +1110,43 @@ async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             player_filter = q.lower()
 
+    filtered = props_pm
     if slug_filter:
-        props_pm = [p for p in props_pm if (p.game_slug or "").lower() == slug_filter]
-        if not props_pm:
-            await update.message.reply_text(f"No encontré props para ese partido.\n`{slug_filter}`", parse_mode=ParseMode.MARKDOWN)
+        filtered = [p for p in props_pm if (p.game_slug or "").lower() == slug_filter]
+        if not filtered:
+            await update.message.reply_text(
+                f"No encontré props para ese partido.\n`{slug_filter}`\n\n"
+                f"Slugs disponibles:\n" + "\n".join(set(f"`{p.game_slug}`" for p in props_pm[:20])),
+                parse_mode=ParseMode.MARKDOWN
+            )
             return
 
     if player_filter:
-        props_pm = [p for p in props_pm if player_filter in (p.player or "").lower()]
-        if not props_pm:
-            await update.message.reply_text(f"No encontré props para ese jugador.\n`{player_filter}`", parse_mode=ParseMode.MARKDOWN)
+        filtered = [p for p in props_pm if player_filter in (p.player or "").lower()]
+        if not filtered:
+            await update.message.reply_text(
+                f"No encontré props para ese jugador: `{player_filter}`",
+                parse_mode=ParseMode.MARKDOWN
+            )
             return
 
-    grouped = _group_props_pretty(props_pm)
+    # Contar fuente
+    sources = {}
+    for p in filtered:
+        sources[p.source] = sources.get(p.source, 0) + 1
+    source_info = ", ".join(f"{s}:{n}" for s, n in sources.items())
 
-    lines = ["🟣 *Polymarket — Props P/R/A (auto)*"]
+    grouped = _group_props_pretty(filtered)
+
+    lines = [f"🟣 *Polymarket — Props P/R/A* ({source_info})"]
+    tipo_order = {"puntos": 0, "rebotes": 1, "asistencias": 2}
+
     for slug in sorted(grouped.keys()):
         lines.append(f"\n*{slug}*")
         players_sorted = sorted(grouped[slug].keys())
         for pl in players_sorted:
             lines.append(f"👤 *{pl}*")
             entries = grouped[slug][pl]
-            # orden: puntos, rebotes, asistencias; luego line asc
-            tipo_order = {"puntos": 0, "rebotes": 1, "asistencias": 2}
             for (tipo, ln) in sorted(entries.keys(), key=lambda x: (tipo_order.get(x[0], 9), x[1])):
                 flags = entries[(tipo, ln)]
                 o = "O" if flags.get("over") else "-"
@@ -841,7 +1159,6 @@ async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # props manuales + polymarket
     props_manual = load_props()
     props_pm = polymarket_props_today_from_scoreboard()
     all_props = (props_manual or []) + (props_pm or [])
@@ -855,7 +1172,6 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # juegos live
     try:
         games = scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"]
     except Exception as e:
@@ -864,10 +1180,12 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     live_games = [g for g in games if g.get("gameStatus") == 2]
     if not live_games:
-        await update.message.reply_text("No hay partidos en vivo ahora.\nUsa `/games` o `/today` para ver la cartelera.", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text(
+            "No hay partidos en vivo ahora.\nUsa `/games` o `/today` para ver la cartelera.",
+            parse_mode=ParseMode.MARKDOWN
+        )
         return
 
-    # index props por jugador (pid)
     by_pid: Dict[int, List[Prop]] = {}
     for p in all_props:
         pid = get_pid_for_name(p.player)
@@ -1106,9 +1424,10 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("games", cmd_games))
-    app.add_handler(CommandHandler("today", cmd_games))   # ✅ alias
+    app.add_handler(CommandHandler("today", cmd_games))
     app.add_handler(CommandHandler("odds", cmd_odds))
     app.add_handler(CommandHandler("live", cmd_live))
+    app.add_handler(CommandHandler("debug", cmd_debug))   # ← nuevo
 
     app.post_init = on_startup
     app.run_polling(allowed_updates=Update.ALL_TYPES)
