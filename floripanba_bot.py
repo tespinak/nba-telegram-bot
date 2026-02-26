@@ -920,22 +920,38 @@ def polymarket_props_today_from_scoreboard() -> List[Prop]:
 # Commands
 # =========================
 HELP_TEXT = (
-    "🧠 *NBA Interactive Bot*\n\n"
-    "Comandos:\n"
-    "• `/games`   → programación NBA de hoy\n"
-    "• `/today`   → alias de /games\n"
-    "• `/odds`    → props P/R/A con score 1-100\n"
-    "   - `/odds nba-okc-det-2026-02-25` (un partido)\n"
-    "   - `/odds Nikola Jokic`           (un jugador)\n"
-    "• `/lineup`  → alineaciones + injury report + análisis\n"
-    "   - `/lineup BOS`  (filtrar por tricode de equipo)\n"
-    "• `/live`    → top props en vivo + scoring\n"
-    "• `/debug`   → info técnica de Polymarket\n\n"
-    "Opcional manual:\n"
-    "• `/add Nombre | tipo | side | linea`\n"
-    "   Ej: `/add Jalen Duren | puntos | over | 15.5`\n"
-    "   tipo: puntos / rebotes / asistencias\n"
-    "   side: over / under\n"
+    "🧠 *NBA Props Bot*\n\n"
+
+    "*📋 Info & Programación*\n"
+    "• `/games` `/today` → partidos de hoy\n"
+    "• `/lineup` → alineaciones + injury report\n"
+    "   `/lineup BOS` → filtrar por equipo\n\n"
+
+    "*📊 Props & Análisis*\n"
+    "• `/odds` → todas las props con score 1-100\n"
+    "   `/odds nba-bos-den-...` → un partido\n"
+    "   `/odds Jokic` → un jugador\n"
+    "• `/alertas` → ranking mejores props hoy (PRE≥55)\n"
+    "• `/analisis Jugador | tipo | side | linea`\n"
+    "   → análisis profundo: tendencia, racha, H/A splits,\n"
+    "     matchup histórico vs rival, veredicto\n"
+    "   Ej: `/analisis Nikola Jokic | puntos | over | 27.5`\n\n"
+
+    "*🔴 En vivo*\n"
+    "• `/live` → top props en vivo con scoring\n\n"
+
+    "*💰 Tracking de apuestas*\n"
+    "• `/bet Jugador | tipo | side | linea | monto`\n"
+    "   Ej: `/bet Jokic | puntos | over | 27.5 | 50`\n"
+    "• `/misapuestas` → ver apuestas pendientes\n"
+    "• `/resultado ID WIN|LOSS|PUSH stat`\n"
+    "   Ej: `/resultado A3F2B1 WIN 29`\n"
+    "• `/historial` → ROI, win rate, rachas, top jugadores\n"
+    "   `/historial 7` → últimos 7 días\n\n"
+
+    "*⚙️ Manual & Debug*\n"
+    "• `/add Jugador | tipo | side | linea` → prop manual\n"
+    "• `/debug` → estado técnico de Polymarket\n"
 )
 
 def parse_add(text: str) -> Optional[Prop]:
@@ -1941,6 +1957,910 @@ async def cmd_lineup(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN
         )
 
+# ================================================================
+# BLOQUE 1 — ANÁLISIS ESTADÍSTICO AVANZADO
+# ================================================================
+
+def get_full_gamelog(pid: int) -> Tuple[List[str], List[list]]:
+    """Devuelve headers y rows completos del gamelog (usa cache existente)."""
+    return get_gamelog_table(pid)
+
+def gamelog_col(headers: List[str], rows: List[list], col: str) -> List[float]:
+    """Extrae una columna del gamelog como lista de floats (juego más reciente primero)."""
+    if not headers or not rows:
+        return []
+    try:
+        idx = headers.index(col)
+    except ValueError:
+        return []
+    vals = []
+    for r in rows:
+        try:
+            vals.append(float(r[idx]))
+        except Exception:
+            pass
+    return vals
+
+def gamelog_col_str(headers: List[str], rows: List[list], col: str) -> List[str]:
+    """Extrae una columna del gamelog como lista de strings."""
+    if not headers or not rows:
+        return []
+    try:
+        idx = headers.index(col)
+    except ValueError:
+        return []
+    return [str(r[idx]) for r in rows if idx < len(r)]
+
+def trend_arrow(values: List[float]) -> str:
+    """Flecha de tendencia basada en los últimos 5 vs anteriores 5."""
+    if len(values) < 6:
+        return "→"
+    rec  = sum(values[:5])  / 5
+    prev = sum(values[5:10]) / min(5, len(values[5:10]))
+    diff = rec - prev
+    if diff >  1.5: return "📈"
+    if diff < -1.5: return "📉"
+    return "→"
+
+def streak_info(values: List[float], line: float, side: str) -> str:
+    """Calcula racha actual (ej: '4 en racha ✅' o '2 sin cumplir ❌')."""
+    if not values:
+        return "sin datos"
+    count = 0
+    if side == "over":
+        hit_fn = lambda v: v > line
+    else:
+        hit_fn = lambda v: v < line
+    first_hit = hit_fn(values[0])
+    for v in values:
+        if hit_fn(v) == first_hit:
+            count += 1
+        else:
+            break
+    emoji = "✅" if first_hit else "❌"
+    label = "en racha" if first_hit else "sin cumplir"
+    return f"{count} {label} {emoji}"
+
+def matchup_stats(pid: int, opp_tricode: str, tipo: str) -> Optional[dict]:
+    """
+    Stats del jugador contra ese rival específico esta temporada.
+    Busca en el gamelog partidos donde MATCHUP contiene el tricode.
+    """
+    headers, rows = get_full_gamelog(pid)
+    if not headers or not rows:
+        return None
+    col = STAT_COL.get(tipo)
+    if not col:
+        return None
+    try:
+        stat_idx     = headers.index(col)
+        matchup_idx  = headers.index("MATCHUP")
+        min_idx      = headers.index("MIN") if "MIN" in headers else None
+    except ValueError:
+        return None
+
+    opp_upper = opp_tricode.upper()
+    vals = []
+    for r in rows:
+        matchup_str = str(r[matchup_idx]).upper() if matchup_idx < len(r) else ""
+        if opp_upper in matchup_str:
+            try:
+                vals.append(float(r[stat_idx]))
+            except Exception:
+                pass
+
+    if not vals:
+        return None
+    avg = sum(vals) / len(vals)
+    return {
+        "games":  len(vals),
+        "avg":    round(avg, 1),
+        "max":    max(vals),
+        "min":    min(vals),
+        "values": vals,
+    }
+
+def home_away_splits(pid: int, tipo: str) -> dict:
+    """Promedio home vs away del jugador esta temporada."""
+    headers, rows = get_full_gamelog(pid)
+    if not headers or not rows:
+        return {}
+    col = STAT_COL.get(tipo)
+    if not col:
+        return {}
+    try:
+        stat_idx    = headers.index(col)
+        matchup_idx = headers.index("MATCHUP")
+    except ValueError:
+        return {}
+
+    home_vals, away_vals = [], []
+    for r in rows:
+        matchup_str = str(r[matchup_idx]) if matchup_idx < len(r) else ""
+        try:
+            val = float(r[stat_idx])
+        except Exception:
+            continue
+        if " vs. " in matchup_str:
+            home_vals.append(val)
+        elif " @ " in matchup_str:
+            away_vals.append(val)
+
+    result = {}
+    if home_vals:
+        result["home_avg"] = round(sum(home_vals) / len(home_vals), 1)
+        result["home_n"]   = len(home_vals)
+    if away_vals:
+        result["away_avg"] = round(sum(away_vals) / len(away_vals), 1)
+        result["away_n"]   = len(away_vals)
+    return result
+
+def is_back_to_back(pid: int) -> bool:
+    """¿Jugó ayer? Compara la fecha más reciente del gamelog con hoy."""
+    headers, rows = get_full_gamelog(pid)
+    if not headers or not rows:
+        return False
+    try:
+        date_idx = headers.index("GAME_DATE")
+    except ValueError:
+        return False
+    try:
+        last_date_str = str(rows[0][date_idx])   # ej: "FEB 24, 2026"
+        from datetime import datetime, timedelta
+        last_date = datetime.strptime(last_date_str, "%b %d, %Y").date()
+        yesterday = date.today() - timedelta(days=1)
+        return last_date == yesterday
+    except Exception:
+        return False
+
+def build_advanced_analysis(pid: int, player_name: str, tipo: str, line: float,
+                            side: str, opp_tricode: str, is_home: bool) -> str:
+    """
+    Construye el bloque de análisis avanzado para un jugador/prop.
+    Incluye: tendencia, racha, splits H/A, matchup histórico, back-to-back.
+    """
+    v20 = last_n_values(pid, tipo, 20)
+    v10 = last_n_values(pid, tipo, 10)
+    v5  = last_n_values(pid, tipo,  5)
+
+    if not v10:
+        return "_Sin suficientes datos estadísticos_"
+
+    lines_out = []
+
+    # — Promedios y tendencia —
+    avg5  = round(sum(v5)  / len(v5),  1) if v5  else "—"
+    avg10 = round(sum(v10) / len(v10), 1) if v10 else "—"
+    avg20 = round(sum(v20) / len(v20), 1) if v20 else "—"
+    arrow = trend_arrow(v10)
+
+    lines_out.append(
+        f"📊 *Promedios:* últ.5 `{avg5}` | últ.10 `{avg10}` | últ.20 `{avg20}` {arrow}"
+    )
+
+    # — Racha actual —
+    racha = streak_info(v10, line, side)
+    lines_out.append(f"🔁 *Racha actual:* {racha}  (línea `{line}` {side.upper()})")
+
+    # — Últimos 5 juegos detalle —
+    vals_str = "  ".join(f"`{v:.0f}`" for v in v5[:5])
+    lines_out.append(f"🕐 *Últ. 5 juegos:* {vals_str}")
+
+    # — Home/Away splits —
+    splits = home_away_splits(pid, tipo)
+    if splits:
+        loc     = "home" if is_home else "away"
+        opp_loc = "away" if is_home else "home"
+        loc_avg = splits.get(f"{loc}_avg")
+        opp_avg = splits.get(f"{opp_loc}_avg")
+        loc_n   = splits.get(f"{loc}_n", 0)
+        loc_icon = "🏠" if is_home else "✈️"
+        if loc_avg is not None:
+            diff_ha = round(loc_avg - (opp_avg or loc_avg), 1)
+            sign    = "+" if diff_ha >= 0 else ""
+            lines_out.append(
+                f"{loc_icon} *H/A split:* prom {loc_loc_str(is_home)} `{loc_avg}` "
+                f"({loc_n}G)  vs prom opuesto `{opp_avg or '—'}` → dif `{sign}{diff_ha}`"
+            )
+
+    # — Matchup histórico vs rival —
+    mu = matchup_stats(pid, opp_tricode, tipo)
+    if mu and mu["games"] >= 1:
+        lines_out.append(
+            f"🆚 *vs {opp_tricode}:* `{mu['avg']}` prom en {mu['games']}G "
+            f"(max `{mu['max']:.0f}` / min `{mu['min']:.0f}`)"
+        )
+    else:
+        lines_out.append(f"🆚 *vs {opp_tricode}:* sin historial esta temporada")
+
+    # — Back-to-back —
+    if is_back_to_b2b := is_back_to_back(pid):
+        lines_out.append("⚠️ *BACK-TO-BACK:* jugó ayer → posible reducción de minutos/rendimiento")
+
+    # — Veredicto automático —
+    verdict = _auto_verdict(v10, line, side, avg10 if isinstance(avg10, float) else 0,
+                             mu, splits, is_home, is_back_to_b2b)
+    lines_out.append(f"\n🧠 *Veredicto:* {verdict}")
+
+    return "\n".join(lines_out)
+
+def loc_loc_str(is_home: bool) -> str:
+    return "local" if is_home else "visitante"
+
+def _auto_verdict(v10, line, side, avg10, mu, splits, is_home, is_b2b) -> str:
+    """Genera un veredicto textual automático basado en todos los factores."""
+    signals = []
+    warnings = []
+
+    # Señal 1: promedio vs línea
+    if side == "over":
+        gap = avg10 - line
+        if gap >  2: signals.append(f"promedio {avg10:.1f} supera la línea por {gap:.1f}")
+        elif gap < -2: warnings.append(f"promedio {avg10:.1f} está {abs(gap):.1f} por debajo")
+    else:
+        gap = line - avg10
+        if gap >  2: signals.append(f"promedio {avg10:.1f} está {gap:.1f} bajo la línea")
+        elif gap < -2: warnings.append(f"promedio {avg10:.1f} supera la línea por {abs(gap):.1f}")
+
+    # Señal 2: racha
+    h5, _ = hit_counts(v10[:5], line, side)
+    if h5 >= 4: signals.append(f"viene de cumplir {h5}/5 últimos")
+    elif h5 <= 1: warnings.append(f"solo {h5}/5 últimos cumplieron")
+
+    # Señal 3: matchup
+    if mu:
+        mu_gap = mu["avg"] - line if side == "over" else line - mu["avg"]
+        if mu_gap > 1.5: signals.append(f"historial favorable vs rival ({mu['avg']:.1f} prom)")
+        elif mu_gap < -1.5: warnings.append(f"historial desfavorable vs rival ({mu['avg']:.1f} prom)")
+
+    # Señal 4: split H/A
+    loc = "home" if is_home else "away"
+    loc_avg = splits.get(f"{loc}_avg") if splits else None
+    if loc_avg:
+        split_gap = loc_avg - line if side == "over" else line - loc_avg
+        if split_gap > 1.5: signals.append(f"mejor de {loc_loc_str(is_home)} ({loc_avg:.1f} prom)")
+        elif split_gap < -1.5: warnings.append(f"peor de {loc_loc_str(is_home)} ({loc_avg:.1f} prom)")
+
+    # Señal 5: back-to-back
+    if is_b2b:
+        warnings.append("back-to-back reduce rendimiento esperado")
+
+    if len(signals) >= 2 and len(warnings) == 0:
+        return f"✅ *FAVORABLE* — {'; '.join(signals)}"
+    elif len(signals) >= 1 and len(warnings) == 0:
+        return f"🟡 *LIGERA VENTAJA* — {signals[0]}"
+    elif len(warnings) >= 2 and len(signals) == 0:
+        return f"🔴 *EN CONTRA* — {'; '.join(warnings)}"
+    elif len(warnings) >= 1 and len(signals) == 0:
+        return f"🟠 *PRECAUCIÓN* — {warnings[0]}"
+    elif signals and warnings:
+        return f"⚖️ *MIXTO* — a favor: {signals[0]} | en contra: {warnings[0]}"
+    else:
+        return "⚪ Sin señal clara — datos insuficientes"
+
+async def cmd_analisis(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /analisis Jugador | tipo | side | linea
+    Ej: /analisis Nikola Jokic | puntos | over | 27.5
+    """
+    body = re.sub(r"^/analisis(@\w+)?\s*", "", (update.message.text or "")).strip()
+    if "|" not in body:
+        await update.message.reply_text(
+            "Formato: `/analisis Nombre | tipo | side | linea`\n"
+            "Ej: `/analisis Nikola Jokic | puntos | over | 27.5`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    parts = [x.strip() for x in body.split("|")]
+    if len(parts) != 4:
+        await update.message.reply_text("Necesito exactamente 4 campos separados por `|`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    player_name, tipo, side, line_s = parts
+    tipo = tipo.lower()
+    side = side.lower()
+    if tipo not in ("puntos", "rebotes", "asistencias"):
+        await update.message.reply_text("tipo debe ser: puntos / rebotes / asistencias")
+        return
+    if side not in ("over", "under"):
+        await update.message.reply_text("side debe ser: over / under")
+        return
+    try:
+        line = float(line_s)
+    except Exception:
+        await update.message.reply_text("La línea debe ser un número (ej: 27.5)")
+        return
+
+    msg_wait = await update.message.reply_text(
+        f"🔍 Analizando *{player_name}* — {tipo} {side} {line}...",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    # Ejecutar en thread para no bloquear
+    def _run():
+        pid = get_pid_for_name(player_name)
+        if not pid:
+            return None, None, None
+        po, pu, meta = pre_score_cached(pid, tipo, line)
+        # Intentar detectar rival desde props del día
+        opp_tricode = "???"
+        is_home = True
+        props_hoy = PM_CACHE.get("props", [])
+        for p in props_hoy:
+            if p.player.lower() == player_name.lower() and p.game_slug:
+                parts_slug = (p.game_slug or "").replace("nba-","").split("-")
+                if len(parts_slug) >= 2:
+                    opp_tricode = parts_slug[1].upper() if is_home else parts_slug[0].upper()
+                break
+        return pid, po if side == "over" else pu, meta
+
+    pid, pre, meta = await asyncio.to_thread(_run)
+
+    if not pid:
+        await msg_wait.edit_text(f"⚠️ No encontré al jugador: *{player_name}*", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # Detectar rival e is_home desde props cacheados
+    opp_tricode = "???"
+    is_home = True
+    for p in PM_CACHE.get("props", []):
+        if p.player.lower() == player_name.lower() and p.game_slug:
+            slug_parts = (p.game_slug or "").replace("nba-","").split("-")
+            if len(slug_parts) >= 2:
+                # Heurística: buscamos en rosters de cada equipo del slug
+                opp_tricode = slug_parts[1].upper()
+                is_home = False  # visitante por defecto
+            break
+
+    analysis_text = await asyncio.to_thread(
+        build_advanced_analysis, pid, player_name, tipo, line, side, opp_tricode, is_home
+    )
+
+    pre_label = _pre_label(pre or 0)
+    pre_emoji = _pre_rating_emoji(pre or 0)
+    pre_bar   = _pre_bar(pre or 0)
+
+    header = (
+        f"🔬 *ANÁLISIS AVANZADO*\n"
+        f"👤 *{player_name}*\n"
+        f"📌 {tipo.upper()} {side.upper()} `{line}`\n"
+        f"{pre_emoji} PRE Score: `{pre}/100` {pre_bar} _{pre_label}_\n"
+        f"{'─'*30}"
+    )
+
+    full = f"{header}\n\n{analysis_text}"
+    if len(full) > 3900:
+        full = full[:3900] + "\n…"
+    await msg_wait.edit_text(full, parse_mode=ParseMode.MARKDOWN)
+
+
+# ================================================================
+# BLOQUE 2 — ALERTAS PRE-PARTIDO INTELIGENTES
+# ================================================================
+
+SMART_ALERTS_FILE  = "smart_alerts_state.json"
+SMART_ALERT_THRESH = 68   # PRE score mínimo para alerta pre-partido
+SMART_ALERT_HOUR_START = 10  # hora local a partir de la cual enviar alertas pre-partido
+SMART_ALERTS_SENT_TTL  = 20 * 60 * 60  # no reenviar la misma alerta en 20h
+
+def load_smart_alerts_state() -> dict:
+    return load_json(SMART_ALERTS_FILE, {})
+
+def save_smart_alerts_state(st: dict):
+    save_json(SMART_ALERTS_FILE, st)
+
+def _smart_alert_key(player: str, tipo: str, side: str, line: float) -> str:
+    d = date.today().isoformat()
+    return f"{d}|{player.lower()}|{tipo}|{side}|{line}"
+
+def _build_pre_game_alert(player: str, tipo: str, side: str, line: float,
+                           pre: int, meta: dict, extra_flags: List[str]) -> str:
+    """Formatea el mensaje de alerta pre-partido."""
+    tipo_icon = {"puntos": "🏀", "rebotes": "💪", "asistencias": "🎯"}.get(tipo, "•")
+    pre_emoji = _pre_rating_emoji(pre)
+    pre_bar   = _pre_bar(pre)
+    pre_lbl   = _pre_label(pre)
+
+    h5  = meta.get("hits5",  "?")
+    n5  = meta.get("n5",     "?")
+    h10 = meta.get("hits10", "?")
+    n10 = meta.get("n10",    "?")
+    avg = meta.get("avg10",  None)
+
+    flags_str = "\n".join(f"  ⚡ {f}" for f in extra_flags) if extra_flags else ""
+
+    msg = (
+        f"🔔 *ALERTA PRE-PARTIDO*\n"
+        f"{'─'*28}\n"
+        f"👤 *{player}*\n"
+        f"{tipo_icon} {tipo.upper()} *{side.upper()}* `{line}`\n\n"
+        f"{pre_emoji} PRE Score: *{pre}/100* {pre_bar}\n"
+        f"_{pre_lbl}_ — `{h5}/{n5}` últ.5 | `{h10}/{n10}` últ.10"
+        + (f" | prom `{avg:.1f}`" if avg else "") + "\n"
+    )
+    if flags_str:
+        msg += f"\n{flags_str}\n"
+    return msg
+
+async def background_smart_alerts(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Job periódico que analiza props pre-partido y envía alertas cuando
+    el PRE score supera el umbral, con señales de contexto adicionales.
+    """
+    chat_id = context.job.chat_id
+    state   = load_smart_alerts_state()
+    now     = now_ts()
+
+    props_pm = await asyncio.to_thread(polymarket_props_today_from_scoreboard)
+    if not props_pm:
+        return
+
+    # Solo props que aún no han empezado (gameStatus == 1)
+    try:
+        games = await asyncio.to_thread(
+            lambda: scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"]
+        )
+    except Exception:
+        return
+
+    pregame_slugs = set()
+    for g in games:
+        if g.get("gameStatus", 1) == 1:   # 1 = pre-partido
+            pregame_slugs.add(_slug_from_scoreboard_game(g))
+
+    # Filtrar solo props de partidos que aún no empiezan
+    pregame_props = [p for p in props_pm if (p.game_slug or "") in pregame_slugs and p.side == "over"]
+
+    for p in pregame_props:
+        alert_key = _smart_alert_key(p.player, p.tipo, p.side, p.line)
+        last_sent = int(state.get(alert_key, 0))
+        if now - last_sent < SMART_ALERTS_SENT_TTL:
+            continue  # ya enviada hoy
+
+        def _calc(player=p.player, tipo=p.tipo, line=p.line):
+            pid = get_pid_for_name(player)
+            if not pid:
+                return None, 0, {}
+            po, _, meta = pre_score_cached(pid, tipo, line)
+            return pid, po, meta
+
+        pid, pre_over, meta = await asyncio.to_thread(_calc)
+        if not pid or pre_over < SMART_ALERT_THRESH:
+            continue
+
+        # Señales adicionales de contexto
+        extra_flags: List[str] = []
+
+        def _extra(pid=pid, player=p.player, tipo=p.tipo, line=p.line):
+            flags = []
+            v10 = last_n_values(pid, tipo, 10)
+            if not v10:
+                return flags
+            # Racha actual
+            h3 = sum(1 for v in v10[:3] if v > line)
+            if h3 == 3:
+                flags.append("En racha: cumplió los últimos 3 partidos ✅")
+            # Tendencia alcista
+            if len(v10) >= 6 and (sum(v10[:5])/5) > (sum(v10[5:])/len(v10[5:])) + 1.5:
+                flags.append("Tendencia ALCISTA en últimos 5 🔺")
+            # Back-to-back
+            if is_back_to_back(pid):
+                flags.append("⚠️ Back-to-back — puede afectar minutos")
+            return flags
+
+        extra_flags = await asyncio.to_thread(_extra)
+
+        alert_msg = _build_pre_game_alert(
+            p.player, p.tipo, "over", p.line, pre_over, meta, extra_flags
+        )
+
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=alert_msg, parse_mode=ParseMode.MARKDOWN)
+            state[alert_key] = now
+            log.info(f"Smart alert enviada: {p.player} {p.tipo} over {p.line} PRE={pre_over}")
+        except Exception as e:
+            log.warning(f"Error enviando smart alert: {e}")
+
+    save_smart_alerts_state(state)
+
+async def cmd_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /alertas — muestra todas las props pre-partido con PRE ≥ 60, ordenadas.
+    """
+    msg_wait = await update.message.reply_text(
+        "🔍 *Buscando mejores props pre-partido...*",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    props_pm = await asyncio.to_thread(polymarket_props_today_from_scoreboard)
+    if not props_pm:
+        await msg_wait.edit_text("❌ Sin props disponibles.")
+        return
+
+    # Solo OVER (el under se analiza independiente)
+    props_over = [p for p in props_pm if p.side == "over"]
+
+    # Calcular PRE en paralelo
+    async def _calc_one(p: Prop):
+        def _inner():
+            pid = get_pid_for_name(p.player)
+            if not pid:
+                return None, 0, {}
+            po, pu, meta = pre_score_cached(pid, p.tipo, p.line)
+            return pid, po, meta
+        return p, await asyncio.to_thread(_inner)
+
+    results = await asyncio.gather(*[_calc_one(p) for p in props_over])
+
+    # Filtrar y ordenar por PRE score
+    scored = []
+    for prop, (pid, pre, meta) in results:
+        if pid and pre >= 55:
+            scored.append((pre, prop, meta))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    if not scored:
+        await msg_wait.edit_text(
+            "😔 No hay props con PRE ≥ 55 hoy.\n"
+            "Usa `/odds` para ver todas con sus scores.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    today_str = date.today().strftime("%d/%m/%Y")
+    lines = [
+        f"🏆 *MEJORES PROPS HOY — {today_str}*",
+        f"_{len(scored)} props con PRE ≥ 55, ordenadas por score_\n",
+    ]
+
+    tipo_icon = {"puntos": "🏀", "rebotes": "💪", "asistencias": "🎯"}
+    for i, (pre, prop, meta) in enumerate(scored[:20], 1):
+        icon     = tipo_icon.get(prop.tipo, "•")
+        pre_e    = _pre_rating_emoji(pre)
+        bar      = _pre_bar(pre, 6)
+        avg10    = meta.get("avg10")
+        h5, n5   = meta.get("hits5","?"), meta.get("n5","?")
+        h10, n10 = meta.get("hits10","?"), meta.get("n10","?")
+        matchup  = _slug_to_matchup(prop.game_slug or "")
+        avg_str  = f"prom `{avg10:.1f}`" if avg10 else ""
+
+        lines.append(
+            f"*{i}.* {pre_e} `{pre}/100` — *{prop.player}*\n"
+            f"   {icon} {prop.tipo.upper()} OVER `{prop.line}`  _{matchup}_\n"
+            f"   {bar}  {avg_str}  `{h5}/{n5}` últ5 | `{h10}/{n10}` últ10"
+        )
+
+    msg = "\n".join(lines)
+    if len(msg) > 3900:
+        msg = msg[:3900] + "\n…(recortado)"
+    await msg_wait.edit_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+# ================================================================
+# BLOQUE 3 — HISTORIAL Y TRACKING DE APUESTAS
+# ================================================================
+
+BETS_FILE = "bets.json"
+
+@dataclass
+class Bet:
+    id: str                    # uuid corto
+    user_id: int
+    player: str
+    tipo: str
+    side: str
+    line: float
+    amount: float              # unidades o $
+    pre_score: int
+    game_slug: str
+    placed_at: int             # timestamp
+    result: Optional[str] = None   # "win" | "loss" | "push" | None (pendiente)
+    actual_stat: Optional[float] = None
+    resolved_at: Optional[int] = None
+    notes: str = ""
+
+def load_bets() -> List[Bet]:
+    raw = load_json(BETS_FILE, {"bets": []})
+    out = []
+    for b in raw.get("bets", []):
+        try:
+            out.append(Bet(**b))
+        except Exception:
+            pass
+    return out
+
+def save_bets(bets: List[Bet]):
+    save_json(BETS_FILE, {"bets": [asdict(b) for b in bets]})
+
+def _new_bet_id() -> str:
+    import uuid
+    return str(uuid.uuid4())[:8].upper()
+
+def _parse_bet_command(text: str) -> Optional[dict]:
+    """
+    Parsea: /bet Jugador | tipo | side | linea | monto
+    Ej:     /bet Nikola Jokic | puntos | over | 27.5 | 50
+    """
+    body = re.sub(r"^/bet(@\w+)?\s*", "", text).strip()
+    parts = [x.strip() for x in body.split("|")]
+    if len(parts) < 4:
+        return None
+    player, tipo, side, line_s = parts[0], parts[1], parts[2], parts[3]
+    amount_s = parts[4] if len(parts) >= 5 else "1"
+    tipo = tipo.lower(); side = side.lower()
+    if tipo not in ("puntos","rebotes","asistencias"): return None
+    if side not in ("over","under"): return None
+    try:
+        line   = float(line_s)
+        amount = float(amount_s)
+    except Exception:
+        return None
+    return {"player": player, "tipo": tipo, "side": side, "line": line, "amount": amount}
+
+async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /bet Jugador | tipo | side | linea | monto
+    Registra una apuesta y calcula el PRE score.
+    """
+    parsed = _parse_bet_command(update.message.text or "")
+    if not parsed:
+        await update.message.reply_text(
+            "Formato: `/bet Jugador | tipo | side | linea | monto`\n"
+            "Ej: `/bet Nikola Jokic | puntos | over | 27.5 | 50`\n"
+            "_monto es opcional (default: 1 unidad)_",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    msg_wait = await update.message.reply_text("⏳ Registrando apuesta...", parse_mode=ParseMode.MARKDOWN)
+    user_id = update.effective_user.id if update.effective_user else 0
+
+    def _calc():
+        pid = get_pid_for_name(parsed["player"])
+        if not pid:
+            return None, 0, {}, ""
+        po, pu, meta = pre_score_cached(pid, parsed["tipo"], parsed["line"])
+        pre = po if parsed["side"] == "over" else pu
+        # Buscar game_slug
+        slug = ""
+        for p in PM_CACHE.get("props", []):
+            if p.player.lower() == parsed["player"].lower():
+                slug = p.game_slug or ""
+                break
+        return pid, pre, meta, slug
+
+    pid, pre, meta, slug = await asyncio.to_thread(_calc)
+
+    if not pid:
+        await msg_wait.edit_text(f"⚠️ Jugador no encontrado: *{parsed['player']}*", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    bet = Bet(
+        id          = _new_bet_id(),
+        user_id     = user_id,
+        player      = parsed["player"],
+        tipo        = parsed["tipo"],
+        side        = parsed["side"],
+        line        = parsed["line"],
+        amount      = parsed["amount"],
+        pre_score   = pre,
+        game_slug   = slug,
+        placed_at   = now_ts(),
+    )
+
+    bets = load_bets()
+    bets.append(bet)
+    save_bets(bets)
+
+    pre_e   = _pre_rating_emoji(pre)
+    pre_bar = _pre_bar(pre)
+    tipo_icon = {"puntos": "🏀", "rebotes": "💪", "asistencias": "🎯"}.get(parsed["tipo"], "•")
+
+    confirm = (
+        f"✅ *Apuesta registrada* `#{bet.id}`\n"
+        f"{'─'*28}\n"
+        f"👤 *{bet.player}*\n"
+        f"{tipo_icon} {bet.tipo.upper()} *{bet.side.upper()}* `{bet.line}`\n"
+        f"💰 Monto: `{bet.amount}` unidades\n"
+        f"{pre_e} PRE Score: `{pre}/100` {pre_bar}\n"
+        f"📅 {date.today().strftime('%d/%m/%Y')}\n\n"
+        f"_Usa `/resultado {bet.id} WIN 28` cuando termine el partido_"
+    )
+    await msg_wait.edit_text(confirm, parse_mode=ParseMode.MARKDOWN)
+
+async def cmd_resultado(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /resultado ID WIN|LOSS|PUSH stat_real
+    Ej: /resultado A3F2B1C0 WIN 29.0
+    """
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Formato: `/resultado ID WIN|LOSS|PUSH stat_real`\n"
+            "Ej: `/resultado A3F2B1C0 WIN 29`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    bet_id   = args[0].upper()
+    result   = args[1].upper()
+    actual   = float(args[2]) if len(args) >= 3 else None
+
+    if result not in ("WIN","LOSS","PUSH"):
+        await update.message.reply_text("Resultado debe ser WIN, LOSS o PUSH")
+        return
+
+    bets = load_bets()
+    found = None
+    for b in bets:
+        if b.id == bet_id:
+            found = b
+            b.result       = result.lower()
+            b.actual_stat  = actual
+            b.resolved_at  = now_ts()
+            break
+
+    if not found:
+        await update.message.reply_text(f"No encontré la apuesta `{bet_id}`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    save_bets(bets)
+
+    emoji = {"win": "✅", "loss": "❌", "push": "🔁"}.get(result.lower(), "❓")
+    actual_str = f" | stat real: `{actual}`" if actual else ""
+    await update.message.reply_text(
+        f"{emoji} Apuesta `#{bet_id}` → *{result}*{actual_str}\n"
+        f"👤 {found.player} — {found.tipo.upper()} {found.side.upper()} `{found.line}`",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def cmd_historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /historial — muestra estadísticas completas de tus apuestas.
+    /historial 30 — últimos 30 días (default: 30)
+    """
+    args = context.args or []
+    days = int(args[0]) if args and args[0].isdigit() else 30
+    user_id = update.effective_user.id if update.effective_user else 0
+    cutoff  = now_ts() - days * 86400
+
+    bets = load_bets()
+    # Filtrar por usuario y periodo
+    mine = [b for b in bets if b.user_id == user_id and b.placed_at >= cutoff]
+
+    if not mine:
+        await update.message.reply_text(
+            f"No tienes apuestas registradas en los últimos {days} días.\n"
+            "Usa `/bet` para registrar una.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    resolved   = [b for b in mine if b.result in ("win","loss","push")]
+    pending    = [b for b in mine if not b.result]
+    wins       = [b for b in resolved if b.result == "win"]
+    losses     = [b for b in resolved if b.result == "loss"]
+    pushes     = [b for b in resolved if b.result == "push"]
+
+    total_res  = len(wins) + len(losses)
+    win_rate   = round(len(wins) / total_res * 100, 1) if total_res else 0
+    net_units  = sum(b.amount for b in wins) - sum(b.amount for b in losses)
+    roi        = round(net_units / sum(b.amount for b in resolved) * 100, 1) if resolved else 0
+
+    # Stats por tipo
+    def type_stats(bets_list, tipo):
+        sub = [b for b in bets_list if b.tipo == tipo and b.result in ("win","loss")]
+        w   = sum(1 for b in sub if b.result == "win")
+        return f"`{w}/{len(sub)}`" if sub else "—"
+
+    # Stats por side
+    def side_stats(bets_list, side):
+        sub = [b for b in bets_list if b.side == side and b.result in ("win","loss")]
+        w   = sum(1 for b in sub if b.result == "win")
+        return f"`{w}/{len(sub)}`" if sub else "—"
+
+    # Mejor y peor racha
+    def calc_streaks(bets_sorted):
+        best = cur_best = 0
+        worst = cur_worst = 0
+        for b in bets_sorted:
+            if b.result == "win":
+                cur_best += 1; cur_worst = 0
+            elif b.result == "loss":
+                cur_worst += 1; cur_best = 0
+            best  = max(best,  cur_best)
+            worst = max(worst, cur_worst)
+        return best, worst
+
+    res_sorted = sorted(resolved, key=lambda b: b.placed_at)
+    best_streak, worst_streak = calc_streaks(res_sorted)
+
+    # Props más rentables
+    player_stats: Dict[str, dict] = {}
+    for b in resolved:
+        ps = player_stats.setdefault(b.player, {"w":0,"l":0,"net":0})
+        if b.result == "win":   ps["w"]+=1; ps["net"]+=b.amount
+        elif b.result == "loss": ps["l"]+=1; ps["net"]-=b.amount
+
+    top_players = sorted(player_stats.items(), key=lambda x: x[1]["net"], reverse=True)[:3]
+
+    net_sign = "+" if net_units >= 0 else ""
+    roi_sign = "+" if roi >= 0 else ""
+    roi_emoji = "🟢" if roi > 0 else ("🔴" if roi < 0 else "⚪")
+
+    msg = (
+        f"📊 *MI HISTORIAL — últimos {days} días*\n"
+        f"{'─'*30}\n"
+        f"📝 Total apuestas: `{len(mine)}`  "
+        f"(resueltas: `{len(resolved)}` | pendientes: `{len(pending)}`)\n\n"
+        f"✅ Wins:  `{len(wins)}`    ❌ Losses: `{len(losses)}`    🔁 Push: `{len(pushes)}`\n"
+        f"🎯 Win rate: *{win_rate}%*\n"
+        f"{roi_emoji} ROI: *{roi_sign}{roi}%*  |  Neto: `{net_sign}{net_units:.1f}` unidades\n\n"
+        f"{'─'*30}\n"
+        f"*Por tipo:*\n"
+        f"  🏀 Puntos:     {type_stats(resolved,'puntos')}\n"
+        f"  💪 Rebotes:    {type_stats(resolved,'rebotes')}\n"
+        f"  🎯 Asistencias:{type_stats(resolved,'asistencias')}\n\n"
+        f"*Por lado:*\n"
+        f"  📈 Over:  {side_stats(resolved,'over')}\n"
+        f"  📉 Under: {side_stats(resolved,'under')}\n\n"
+        f"*Rachas:* mejor `{best_streak}W` | peor `{worst_streak}L`\n\n"
+    )
+
+    if top_players:
+        msg += f"*🏆 Top jugadores (por ganancia):*\n"
+        for pl, st in top_players:
+            sign = "+" if st["net"] >= 0 else ""
+            msg += f"  • {pl}: `{st['w']}W/{st['l']}L`  {sign}{st['net']:.1f}u\n"
+
+    if pending:
+        msg += f"\n*⏳ Pendientes ({len(pending)}):*\n"
+        for b in pending[-5:]:
+            msg += f"  `#{b.id}` {b.player} {b.tipo.upper()} {b.side.upper()} `{b.line}` — `{b.amount}`u\n"
+        if len(pending) > 5:
+            msg += f"  _...y {len(pending)-5} más_\n"
+
+    msg += f"\n_Usa `/resultado ID WIN|LOSS stat` para resolver_"
+
+    if len(msg) > 3900:
+        msg = msg[:3900] + "\n…"
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+async def cmd_misapuestas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /misapuestas — lista las apuestas pendientes del usuario.
+    """
+    user_id = update.effective_user.id if update.effective_user else 0
+    bets    = load_bets()
+    pending = [b for b in bets if b.user_id == user_id and not b.result]
+
+    if not pending:
+        await update.message.reply_text(
+            "No tienes apuestas pendientes.\nUsa `/bet` para registrar una.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    tipo_icon = {"puntos": "🏀", "rebotes": "💪", "asistencias": "🎯"}
+    lines = [f"⏳ *Apuestas pendientes* ({len(pending)})\n"]
+    for b in sorted(pending, key=lambda x: x.placed_at, reverse=True):
+        icon     = tipo_icon.get(b.tipo, "•")
+        pre_e    = _pre_rating_emoji(b.pre_score)
+        matchup  = _slug_to_matchup(b.game_slug) if b.game_slug else "—"
+        ts_str   = time.strftime("%d/%m %H:%M", time.localtime(b.placed_at))
+        lines.append(
+            f"`#{b.id}` {icon} *{b.player}*\n"
+            f"  {b.tipo.upper()} {b.side.upper()} `{b.line}` — `{b.amount}`u\n"
+            f"  {pre_e} PRE `{b.pre_score}/100` | {matchup} | {ts_str}"
+        )
+
+    msg = "\n\n".join(lines)
+    if len(msg) > 3900:
+        msg = msg[:3900] + "\n…"
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
 # =========================
 # Main
 # =========================
@@ -1949,8 +2869,9 @@ async def on_startup(app: Application):
 
 async def register_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    jobs = context.job_queue.get_jobs_by_name(f"scan:{chat_id}")
-    if not jobs:
+
+    # Job: scan en vivo
+    if not context.job_queue.get_jobs_by_name(f"scan:{chat_id}"):
         context.job_queue.run_repeating(
             background_scan,
             interval=POLL_SECONDS,
@@ -1958,21 +2879,46 @@ async def register_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=chat_id,
             name=f"scan:{chat_id}",
         )
-        await update.message.reply_text(f"✅ Background scan activado (cada {POLL_SECONDS}s).")
+        await update.message.reply_text(f"✅ Scan en vivo activado (cada {POLL_SECONDS}s).")
+
+    # Job: alertas pre-partido (cada 30 min)
+    if not context.job_queue.get_jobs_by_name(f"smart:{chat_id}"):
+        context.job_queue.run_repeating(
+            background_smart_alerts,
+            interval=30 * 60,
+            first=15,
+            chat_id=chat_id,
+            name=f"smart:{chat_id}",
+        )
+        await update.message.reply_text("✅ Alertas pre-partido activadas (cada 30min).")
+
     await cmd_help(update, context)
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", register_job))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("add", cmd_add))
-    app.add_handler(CommandHandler("games", cmd_games))
-    app.add_handler(CommandHandler("today", cmd_games))
-    app.add_handler(CommandHandler("odds", cmd_odds))
-    app.add_handler(CommandHandler("live", cmd_live))
-    app.add_handler(CommandHandler("debug", cmd_debug))
-    app.add_handler(CommandHandler("lineup", cmd_lineup))   # ← nuevo
+    # Comandos principales
+    app.add_handler(CommandHandler("start",       register_job))
+    app.add_handler(CommandHandler("help",        cmd_help))
+    app.add_handler(CommandHandler("games",       cmd_games))
+    app.add_handler(CommandHandler("today",       cmd_games))
+    app.add_handler(CommandHandler("odds",        cmd_odds))
+    app.add_handler(CommandHandler("live",        cmd_live))
+    app.add_handler(CommandHandler("lineup",      cmd_lineup))
+    app.add_handler(CommandHandler("debug",       cmd_debug))
+
+    # Análisis avanzado
+    app.add_handler(CommandHandler("analisis",    cmd_analisis))
+    app.add_handler(CommandHandler("alertas",     cmd_alertas))
+
+    # Tracking de apuestas
+    app.add_handler(CommandHandler("bet",         cmd_bet))
+    app.add_handler(CommandHandler("resultado",   cmd_resultado))
+    app.add_handler(CommandHandler("historial",   cmd_historial))
+    app.add_handler(CommandHandler("misapuestas", cmd_misapuestas))
+
+    # Manual
+    app.add_handler(CommandHandler("add",         cmd_add))
 
     app.post_init = on_startup
     app.run_polling(allowed_updates=Update.ALL_TYPES)
