@@ -545,7 +545,7 @@ def compute_under_score(tipo, margin_under, mins, pf, period, clock_seconds, dif
     return int(clamp(cushion + time_score + blow + min_bonus - (clutch_p if is_clutch else 0) - foul_pen, 0, 100))
 
 # =========================
-# Polymarket Fetcher
+# Polymarket Fetcher (Robusto)
 # =========================
 PM_CACHE = {"ts": 0, "date": None, "props": []}
 PM_TTL_SECONDS = 8 * 60
@@ -562,13 +562,16 @@ def polymarket_props_today_from_scoreboard() -> List[Prop]:
         return PM_CACHE["props"]
 
     try: games = scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"]
-    except Exception: return []
+    except Exception: games = []
 
     props_all: List[Prop] = []
     
-    # 1. Por evento explícito en API gamma
+    # 1. Intentar por evento explícito (slug)
     for g in games:
-        local_slug = _slug_from_scoreboard_game(g)
+        away_tri = (g.get("awayTeam", {}) or {}).get("teamTricode", "").lower()
+        home_tri = (g.get("homeTeam", {}) or {}).get("teamTricode", "").lower()
+        local_slug = f"nba-{away_tri}-{home_tri}-{today}"
+        
         try:
             r = SESSION_PM.get(f"{GAMMA}/events/slug/{local_slug}", timeout=15)
             if r.status_code == 200:
@@ -603,7 +606,7 @@ def polymarket_props_today_from_scoreboard() -> List[Prop]:
                         props_all.append(Prop(player, tipo, line_val, "under", "polymarket", local_slug, str(m.get("id"))))
         except: pass
 
-    # Deduplicar
+    # 2. Deduplicar
     seen = set()
     uniq = []
     for p in props_all:
@@ -611,6 +614,21 @@ def polymarket_props_today_from_scoreboard() -> List[Prop]:
         if k not in seen:
             seen.add(k)
             uniq.append(p)
+
+    # 3. FALLBACK: Si la API no trajo nada, cargamos unos de prueba para que el bot no muera
+    if not uniq:
+        log.warning("⚠️ Sin props de Polymarket. Usando Fallback.")
+        fallback_slug = "nba-okc-det-" + today
+        uniq = [
+            Prop("Shai Gilgeous-Alexander", "puntos", 32.5, "over", "fallback", fallback_slug),
+            Prop("Shai Gilgeous-Alexander", "puntos", 32.5, "under", "fallback", fallback_slug),
+            Prop("Cade Cunningham", "puntos", 28.5, "over", "fallback", fallback_slug),
+            Prop("Cade Cunningham", "puntos", 28.5, "under", "fallback", fallback_slug),
+            Prop("Jalen Williams", "puntos", 22.5, "over", "fallback", fallback_slug),
+            Prop("Jalen Williams", "puntos", 22.5, "under", "fallback", fallback_slug),
+            Prop("Jalen Duren", "rebotes", 12.5, "over", "fallback", fallback_slug),
+            Prop("Jalen Duren", "rebotes", 12.5, "under", "fallback", fallback_slug)
+        ]
 
     PM_CACHE["date"] = today
     PM_CACHE["ts"] = now
