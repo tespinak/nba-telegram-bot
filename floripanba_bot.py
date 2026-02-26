@@ -14,7 +14,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -920,38 +920,44 @@ def polymarket_props_today_from_scoreboard() -> List[Prop]:
 # Commands
 # =========================
 HELP_TEXT = (
-    "🧠 *NBA Props Bot*\n\n"
+    "🧠 *NBA Props Bot v3*\n\n"
 
-    "*📋 Info & Programación*\n"
+    "*📋 Programación*\n"
     "• `/games` `/today` → partidos de hoy\n"
     "• `/lineup` → alineaciones + injury report\n"
     "   `/lineup BOS` → filtrar por equipo\n\n"
 
     "*📊 Props & Análisis*\n"
-    "• `/odds` → todas las props con score 1-100\n"
+    "• `/odds` → props con score PRE v2 (contexto incluido)\n"
     "   `/odds nba-bos-den-...` → un partido\n"
     "   `/odds Jokic` → un jugador\n"
-    "• `/alertas` → ranking mejores props hoy (PRE≥55)\n"
+    "• `/alertas` → ranking mejores props del día (PRE≥55)\n"
     "• `/analisis Jugador | tipo | side | linea`\n"
-    "   → análisis profundo: tendencia, racha, H/A splits,\n"
-    "     matchup histórico vs rival, veredicto\n"
-    "   Ej: `/analisis Nikola Jokic | puntos | over | 27.5`\n\n"
+    "   → tendencia · racha · H/A · matchup · veredicto\n"
+    "   Ej: `/analisis Nikola Jokic | puntos | over | 27.5`\n"
+    "• `/contexto AWAY HOME`\n"
+    "   → Def Rating · Pace · stats permitidas por equipo\n"
+    "   Ej: `/contexto BOS DEN`\n\n"
 
     "*🔴 En vivo*\n"
     "• `/live` → top props en vivo con scoring\n\n"
 
-    "*💰 Tracking de apuestas*\n"
+    "*💰 Apuestas*\n"
     "• `/bet Jugador | tipo | side | linea | monto`\n"
-    "   Ej: `/bet Jokic | puntos | over | 27.5 | 50`\n"
-    "• `/misapuestas` → ver apuestas pendientes\n"
-    "• `/resultado ID WIN|LOSS|PUSH stat`\n"
-    "   Ej: `/resultado A3F2B1 WIN 29`\n"
-    "• `/historial` → ROI, win rate, rachas, top jugadores\n"
+    "• `/misapuestas` → pendientes\n"
+    "• `/resultado ID WIN|LOSS|PUSH stat` → cerrar manual\n"
+    "• `/historial` → ROI · win rate · rachas · top jugadores\n"
     "   `/historial 7` → últimos 7 días\n\n"
 
-    "*⚙️ Manual & Debug*\n"
+    "*🤖 Automático (tras /start)*\n"
+    "• Resumen matutino cada día a las 10:00h\n"
+    "• Alertas pre-partido cuando PRE≥68\n"
+    "• Auto-resolución de apuestas al terminar partido\n"
+    "• Alertas en vivo cuando prop alcanza threshold\n\n"
+
+    "*⚙️ Otros*\n"
     "• `/add Jugador | tipo | side | linea` → prop manual\n"
-    "• `/debug` → estado técnico de Polymarket\n"
+    "• `/debug` → estado técnico Polymarket\n"
 )
 
 def parse_add(text: str) -> Optional[Prop]:
@@ -1005,7 +1011,13 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        games = scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"]
+        games = await asyncio.wait_for(
+            asyncio.to_thread(lambda: scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"]),
+            timeout=20.0
+        )
+    except asyncio.TimeoutError:
+        await update.message.reply_text("⚠️ Timeout leyendo scoreboard. Intenta de nuevo.")
+        return
     except Exception as e:
         await update.message.reply_text(f"⚠️ No pude leer scoreboard: {e}")
         return
@@ -1413,57 +1425,73 @@ async def _send_long_message(update, text: str, max_len: int = 3800):
         await asyncio.sleep(0.3)  # pequeña pausa entre partes
 
 async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg_wait = await update.message.reply_text("⏳ *Cargando datos en vivo...*", parse_mode=ParseMode.MARKDOWN)
+
+    # Cargar props en thread
     props_manual = load_props()
-    props_pm = polymarket_props_today_from_scoreboard()
+    props_pm = await asyncio.to_thread(polymarket_props_today_from_scoreboard)
     all_props = (props_manual or []) + (props_pm or [])
 
     if not all_props:
-        await update.message.reply_text(
-            "No tengo props cargados.\n"
-            "• Intenta `/odds` (auto)\n"
-            "• O agrega manual con `/add ...`\n",
+        await msg_wait.edit_text(
+            "No tengo props cargados.\n• Intenta `/odds` primero\n• O `/add` para agregar manualmente",
             parse_mode=ParseMode.MARKDOWN
         )
         return
 
+    # Scoreboard en thread
     try:
-        games = scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"]
+        games = await asyncio.wait_for(
+            asyncio.to_thread(lambda: scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"]),
+            timeout=20.0
+        )
     except Exception as e:
-        await update.message.reply_text(f"⚠️ No pude leer scoreboard: {e}")
+        await msg_wait.edit_text(f"⚠️ Error leyendo scoreboard: {e}")
         return
 
     live_games = [g for g in games if g.get("gameStatus") == 2]
     if not live_games:
-        await update.message.reply_text(
-            "No hay partidos en vivo ahora.\nUsa `/games` o `/today` para ver la cartelera.",
+        await msg_wait.edit_text(
+            "⏸️ No hay partidos en vivo ahora.\nUsa `/games` para ver la cartelera.",
             parse_mode=ParseMode.MARKDOWN
         )
         return
 
-    by_pid: Dict[int, List[Prop]] = {}
-    for p in all_props:
-        pid = get_pid_for_name(p.player)
-        if pid:
-            by_pid.setdefault(pid, []).append(p)
+    await msg_wait.edit_text(
+        f"🔄 *{len(live_games)} partido(s) en vivo* — calculando...",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
+    # Resolver PIDs en thread (bloqueante)
+    def _resolve_pids():
+        by_pid: Dict[int, List[Prop]] = {}
+        for p in all_props:
+            pid = get_pid_for_name(p.player)
+            if pid:
+                by_pid.setdefault(pid, []).append(p)
+        return by_pid
+
+    by_pid = await asyncio.to_thread(_resolve_pids)
     scored_rows = []
 
     for g in live_games:
-        gid = g.get("gameId")
-        status = g.get("gameStatusText", "")
-        period = int(g.get("period", 0) or 0)
+        gid        = g.get("gameId")
+        status     = g.get("gameStatusText", "")
+        period     = int(g.get("period", 0) or 0)
         game_clock = g.get("gameClock", "") or ""
-        clock_sec = clock_to_seconds(game_clock)
-
-        home = g.get("homeTeam", {})
-        away = g.get("awayTeam", {})
-        diff = abs(int(home.get("score", 0)) - int(away.get("score", 0)))
-        is_clutch = diff <= 8
+        clock_sec  = clock_to_seconds(game_clock)
+        home       = g.get("homeTeam", {})
+        away       = g.get("awayTeam", {})
+        diff       = abs(int(home.get("score", 0)) - int(away.get("score", 0)))
+        is_clutch  = diff <= 8
         is_blowout = diff >= BLOWOUT_IS
-        elapsed_min = game_elapsed_minutes(period, clock_sec)
+        elapsed_min= game_elapsed_minutes(period, clock_sec)
 
         try:
-            box = boxscore.BoxScore(gid).get_dict()["game"]
+            box = await asyncio.wait_for(
+                asyncio.to_thread(lambda gid=gid: boxscore.BoxScore(gid).get_dict()["game"]),
+                timeout=15.0
+            )
         except Exception:
             continue
 
@@ -1473,15 +1501,15 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if pid not in by_pid:
                     continue
 
-                s = pl.get("statistics", {})
-                pts = s.get("points", 0) or 0
-                reb = s.get("reboundsTotal", 0) or 0
-                ast = s.get("assists", 0) or 0
-                pf = s.get("foulsPersonal", 0) or 0
+                s    = pl.get("statistics", {})
+                pts  = s.get("points", 0) or 0
+                reb  = s.get("reboundsTotal", 0) or 0
+                ast  = s.get("assists", 0) or 0
+                pf   = s.get("foulsPersonal", 0) or 0
                 mins = parse_minutes(s.get("minutes", ""))
 
                 for pr in by_pid[pid]:
-                    actual = pts if pr.tipo == "puntos" else (reb if pr.tipo == "rebotes" else ast)
+                    actual   = pts if pr.tipo == "puntos" else (reb if pr.tipo == "rebotes" else ast)
                     pre, meta = pre_score(pid, pr.tipo, pr.line, pr.side)
 
                     if pr.side == "over":
@@ -1494,43 +1522,45 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if diff >= BLOWOUT_STRONG:
                             if (pr.tipo == "puntos" and faltante > 1.0) or (pr.tipo != "puntos" and faltante > 0.8):
                                 continue
-
-                        live = compute_over_score(pr.tipo, faltante, mins, pf, period, clock_sec, diff, is_clutch, is_blowout)
+                        live  = compute_over_score(pr.tipo, faltante, mins, pf, period, clock_sec, diff, is_clutch, is_blowout)
                         final = int(clamp(0.55 * live + 0.45 * pre, 0, 100))
                         scored_rows.append((final, live, pre, pr, actual, faltante, status, period, game_clock, mins, pf, diff, meta))
-
                     else:
                         margin_under = float(pr.line) - float(actual)
                         if should_gate_by_minutes("under", pr.tipo, margin_under, mins, elapsed_min, is_blowout):
                             continue
-
-                        live = compute_under_score(pr.tipo, margin_under, mins, pf, period, clock_sec, diff, is_clutch, is_blowout)
+                        live  = compute_under_score(pr.tipo, margin_under, mins, pf, period, clock_sec, diff, is_clutch, is_blowout)
                         final = int(clamp(0.65 * live + 0.35 * pre, 0, 100))
                         scored_rows.append((final, live, pre, pr, actual, margin_under, status, period, game_clock, mins, pf, diff, meta))
 
+    await msg_wait.delete()
+
     if not scored_rows:
-        await update.message.reply_text("No encontré props con señal en vivo (cerca de la línea + minutos OK).")
+        await update.message.reply_text(
+            "📭 No hay props cerca de la línea en vivo ahora.\n"
+            "_El bot alertará automáticamente cuando haya señal._",
+            parse_mode=ParseMode.MARKDOWN
+        )
         return
 
     scored_rows.sort(key=lambda x: x[0], reverse=True)
-    top = scored_rows[:18]
+    top = scored_rows[:15]
 
-    out = ["🔥 *TOP LIVE (score final 1-100)*"]
+    tipo_icon = {"puntos": "🏀", "rebotes": "💪", "asistencias": "🎯"}
+    out = [f"🔥 *TOP LIVE — {len(live_games)} partido(s)*\n{'─'*28}"]
     for (final, live, pre, pr, actual, delta, status, period, clock, mins, pf, diff, meta) in top:
         side_tag = "OVER" if pr.side == "over" else "UNDER"
-        extra = f"faltan {delta:.1f}" if pr.side == "over" else f"colchón {delta:.1f}"
+        extra    = f"faltan `{delta:.1f}`" if pr.side == "over" else f"colchón `{delta:.1f}`"
+        icon     = tipo_icon.get(pr.tipo, "•")
         out.append(
-            f"\n👤 *{pr.player}*\n"
-            f"• {pr.tipo} {side_tag} {pr.line}\n"
-            f"FINAL `{final}` (LIVE {live} | PRE {pre}) | actual={actual} ({extra})\n"
-            f"{status} | Q{period} {clock} | MIN {mins:.1f} PF {pf} Diff {diff}\n"
-            f"Forma: 5={meta['hits5']}/{meta['n5']} 10={meta['hits10']}/{meta['n10']} | fuente={pr.source}"
+            f"\n{_pre_rating_emoji(final)} `{final}/100` — *{pr.player}*\n"
+            f"{icon} {pr.tipo.upper()} {side_tag} `{pr.line}` | actual `{actual}` ({extra})\n"
+            f"⏱️ {status} Q{period} {clock} | MIN `{mins:.0f}` PF `{pf}` Dif `{diff}`\n"
+            f"📊 `{meta.get('hits5','?')}/{meta.get('n5','?')}` últ5 | `{meta.get('hits10','?')}/{meta.get('n10','?')}` últ10"
         )
 
     msg = "\n".join(out)
-    if len(msg) > 3800:
-        msg = msg[:3800] + "\n…(recortado)"
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    await _send_long_message(update, msg)
 
 # =========================
 # Background scan
@@ -2916,64 +2946,1148 @@ async def cmd_misapuestas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
+# ================================================================
+# BLOQUE A — CONTEXTO DEFENSIVO + PACE
+# ================================================================
+
+CONTEXT_CACHE: Dict[str, dict] = {}   # team_id → {ts, def_rating, pace, opp_pts_pos}
+CONTEXT_TTL = 4 * 60 * 60             # 4 horas
+
+# Columnas que usamos de leaguedashteamstats
+_TEAM_STAT_COLS = ["TEAM_ID","TEAM_NAME","DEF_RATING","PACE","OPP_PTS_PAINT",
+                   "OPP_PTS_2ND_CHANCE","OPP_PTS_OFF_TOV","OPP_PTS_FB"]
+
+def fetch_league_team_stats() -> Dict[int, dict]:
+    """
+    Descarga leaguedashteamstats (defensive rating, pace, etc.) con cache.
+    Retorna dict team_id → {def_rating, pace, opp_pts_paint, ...}
+    """
+    cache_key = "league_team_stats"
+    now = now_ts()
+    cached = CONTEXT_CACHE.get(cache_key)
+    if cached and (now - cached.get("ts", 0)) < CONTEXT_TTL:
+        return cached.get("data", {})
+
+    time.sleep(0.5)
+    url = "https://stats.nba.com/stats/leaguedashteamstats"
+    params = {
+        "Conference": "", "DateFrom": "", "DateTo": "",
+        "Division": "", "GameScope": "", "GameSegment": "",
+        "LastNGames": "0", "LeagueID": "00", "Location": "",
+        "MeasureType": "Advanced", "Month": "0",
+        "OpponentTeamID": "0", "Outcome": "", "PORound": "0",
+        "PaceAdjust": "N", "PerMode": "PerGame", "Period": "0",
+        "PlayerExperience": "", "PlayerPosition": "", "PlusMinus": "N",
+        "Rank": "N", "Season": SEASON, "SeasonSegment": "",
+        "SeasonType": "Regular Season", "ShotClockRange": "",
+        "StarterBench": "", "TeamID": "0", "TwoWay": "0",
+        "VsConference": "", "VsDivision": "",
+    }
+    try:
+        resp = SESSION_NBA.get(url, params=params, timeout=(12, 60))
+        if resp.status_code != 200:
+            return {}
+        data  = resp.json()
+        rs    = (data.get("resultSets") or [{}])[0]
+        hdrs  = rs.get("headers", [])
+        rows  = rs.get("rowSet",  [])
+        result: Dict[int, dict] = {}
+        for row in rows:
+            rd = dict(zip(hdrs, row))
+            tid = int(rd.get("TEAM_ID", 0))
+            result[tid] = {
+                "team_name": rd.get("TEAM_NAME",""),
+                "def_rating": float(rd.get("DEF_RATING") or 0),
+                "pace":       float(rd.get("PACE")       or 0),
+                "off_rating": float(rd.get("OFF_RATING") or 0),
+            }
+        CONTEXT_CACHE[cache_key] = {"ts": now, "data": result}
+        log.info(f"League team stats cargados: {len(result)} equipos")
+        return result
+    except Exception as e:
+        log.warning(f"fetch_league_team_stats: {e}")
+        return {}
+
+def fetch_opp_position_stats() -> Dict[int, dict]:
+    """
+    Descarga leaguedashteamstats MeasureType=Opponent para ver
+    cuántos puntos/reb/ast permite cada equipo por posición.
+    """
+    cache_key = "opp_pos_stats"
+    now = now_ts()
+    cached = CONTEXT_CACHE.get(cache_key)
+    if cached and (now - cached.get("ts", 0)) < CONTEXT_TTL:
+        return cached.get("data", {})
+
+    time.sleep(0.4)
+    url = "https://stats.nba.com/stats/leaguedashteamstats"
+    params = {
+        "Conference": "", "DateFrom": "", "DateTo": "",
+        "Division": "", "GameScope": "", "GameSegment": "",
+        "LastNGames": "0", "LeagueID": "00", "Location": "",
+        "MeasureType": "Opponent", "Month": "0",
+        "OpponentTeamID": "0", "Outcome": "", "PORound": "0",
+        "PaceAdjust": "N", "PerMode": "PerGame", "Period": "0",
+        "PlayerExperience": "", "PlayerPosition": "", "PlusMinus": "N",
+        "Rank": "N", "Season": SEASON, "SeasonSegment": "",
+        "SeasonType": "Regular Season", "ShotClockRange": "",
+        "StarterBench": "", "TeamID": "0", "TwoWay": "0",
+        "VsConference": "", "VsDivision": "",
+    }
+    try:
+        resp = SESSION_NBA.get(url, params=params, timeout=(12, 60))
+        if resp.status_code != 200:
+            return {}
+        data  = resp.json()
+        rs    = (data.get("resultSets") or [{}])[0]
+        hdrs  = rs.get("headers", [])
+        rows  = rs.get("rowSet",  [])
+        result: Dict[int, dict] = {}
+        for row in rows:
+            rd = dict(zip(hdrs, row))
+            tid = int(rd.get("TEAM_ID", 0))
+            result[tid] = {
+                "opp_pts":  float(rd.get("OPP_PTS")  or 0),
+                "opp_reb":  float(rd.get("OPP_REB")  or 0),
+                "opp_ast":  float(rd.get("OPP_AST")  or 0),
+            }
+        CONTEXT_CACHE[cache_key] = {"ts": now, "data": result}
+        return result
+    except Exception as e:
+        log.warning(f"fetch_opp_position_stats: {e}")
+        return {}
+
+# Caché de team stats indexado por tricode
+_TRICODE_TO_TEAM_ID_CACHE: Dict[str, int] = {}
+
+def get_team_id_cached(tricode: str) -> Optional[int]:
+    if tricode in _TRICODE_TO_TEAM_ID_CACHE:
+        return _TRICODE_TO_TEAM_ID_CACHE[tricode]
+    tid = get_team_id_by_tricode(tricode)
+    if tid:
+        _TRICODE_TO_TEAM_ID_CACHE[tricode] = tid
+    return tid
+
+def get_defensive_context(opp_tricode: str, tipo: str) -> dict:
+    """
+    Retorna contexto defensivo del rival:
+    - def_rating, pace
+    - cuántos puntos/reb/ast permite vs liga
+    - percentil defensivo (0=mejor defensa, 100=peor)
+    """
+    result = {"def_rating": None, "pace": None, "opp_stat": None,
+              "def_rank": None, "pace_rank": None, "verdict": ""}
+
+    team_stats = fetch_league_team_stats()
+    opp_stats  = fetch_opp_position_stats()
+    if not team_stats:
+        return result
+
+    opp_tid = get_team_id_cached(opp_tricode)
+    if not opp_tid or opp_tid not in team_stats:
+        return result
+
+    ts = team_stats[opp_tid]
+    result["def_rating"] = ts["def_rating"]
+    result["pace"]       = ts["pace"]
+
+    # Ranking defensivo (menor def_rating = mejor defensa)
+    all_def = sorted(team_stats.values(), key=lambda x: x["def_rating"])
+    rank_def = next((i+1 for i,t in enumerate(all_def)
+                     if t.get("team_name") == ts["team_name"]), None)
+    result["def_rank"] = rank_def   # 1 = mejor defensa, 30 = peor
+
+    # Ranking de pace (mayor = más rápido)
+    all_pace = sorted(team_stats.values(), key=lambda x: x["pace"], reverse=True)
+    rank_pace = next((i+1 for i,t in enumerate(all_pace)
+                      if t.get("team_name") == ts["team_name"]), None)
+    result["pace_rank"] = rank_pace  # 1 = más rápido
+
+    # Stats permitidos por el rival
+    if opp_tid in opp_stats:
+        os = opp_stats[opp_tid]
+        stat_key = {"puntos": "opp_pts", "rebotes": "opp_reb", "asistencias": "opp_ast"}.get(tipo)
+        if stat_key:
+            result["opp_stat"] = os.get(stat_key)
+            # Ranking de lo que permite (más = peor defensa en esa stat)
+            all_opp = sorted(opp_stats.values(), key=lambda x: x.get(stat_key,0), reverse=True)
+            rank_opp = next((i+1 for i,s in enumerate(all_opp)
+                             if s.get(stat_key) == os.get(stat_key)), None)
+            result["opp_stat_rank"] = rank_opp  # 1 = permite más de esa stat
+
+    # Veredicto automático del contexto
+    verdicts = []
+    if rank_def:
+        if rank_def >= 25:   verdicts.append("defensa débil (permite mucho) ✅")
+        elif rank_def <= 5:  verdicts.append("defensa élite (difícil) ⚠️")
+    if rank_pace:
+        if rank_pace <= 5:   verdicts.append("ritmo alto → más posesiones ✅")
+        elif rank_pace >= 25: verdicts.append("ritmo lento → menos posesiones ⚠️")
+    opp_stat_rank = result.get("opp_stat_rank")
+    if opp_stat_rank:
+        if opp_stat_rank <= 8:   verdicts.append(f"rival top-8 en {tipo} permitidos ✅")
+        elif opp_stat_rank >= 23: verdicts.append(f"rival bottom-8 en {tipo} permitidos ⚠️")
+
+    result["verdict"] = " · ".join(verdicts) if verdicts else "contexto neutro"
+    return result
+
+def format_defensive_context(ctx: dict, tipo: str, opp_tri: str) -> str:
+    """Formatea el contexto defensivo para incluir en mensajes."""
+    if ctx.get("def_rating") is None:
+        return f"_Sin datos defensivos para {opp_tri}_"
+
+    dr   = ctx["def_rating"]
+    pace = ctx["pace"]
+    dr_r = ctx.get("def_rank","?")
+    pr_r = ctx.get("pace_rank","?")
+    os   = ctx.get("opp_stat")
+    osr  = ctx.get("opp_stat_rank","?")
+
+    dr_emoji   = "🟢" if (isinstance(dr_r, int) and dr_r >= 20) else ("🔴" if (isinstance(dr_r, int) and dr_r <= 8) else "🟡")
+    pace_emoji = "🟢" if (isinstance(pr_r, int) and pr_r <= 8) else ("🔴" if (isinstance(pr_r, int) and pr_r >= 23) else "🟡")
+
+    lines = [f"🛡️ *Contexto vs {opp_tri}:*"]
+    lines.append(f"  {dr_emoji} Def Rating: `{dr:.1f}` (rank #{dr_r}/30)")
+    lines.append(f"  {pace_emoji} Pace: `{pace:.1f}` (rank #{pr_r}/30)")
+    if os is not None:
+        osr_emoji = "🟢" if (isinstance(osr, int) and osr <= 8) else ("🔴" if (isinstance(osr, int) and osr >= 23) else "🟡")
+        lines.append(f"  {osr_emoji} {tipo.upper()} permitidos/j: `{os:.1f}` (rank #{osr}/30)")
+    lines.append(f"  💬 _{ctx['verdict']}_")
+    return "\n".join(lines)
+
+
+# ================================================================
+# BLOQUE B — MODELO MEJORADO (PRE v2 con contexto)
+# ================================================================
+
+def pre_score_v2(pid: int, tipo: str, line: float, side: str,
+                 opp_tricode: str = "", is_home: bool = True,
+                 rest_days: int = 1) -> Tuple[int, dict]:
+    """
+    PRE score mejorado que incorpora:
+    - Historial del jugador (igual que v1)
+    - Contexto defensivo del rival (def_rating, pace, opp_stat)
+    - Split home/away
+    - Rest days
+    """
+    # Base: score v1
+    base_score, meta = pre_score(pid, tipo, line, side)
+
+    adjustments = []
+    adj_total = 0.0
+
+    # ── Ajuste 1: contexto defensivo ──
+    if opp_tricode:
+        ctx = get_defensive_context(opp_tricode, tipo)
+        dr_rank   = ctx.get("def_rank")
+        pace_rank = ctx.get("pace_rank")
+        osr       = ctx.get("opp_stat_rank")
+        opp_stat  = ctx.get("opp_stat")
+
+        # Defensive rating del rival
+        if dr_rank:
+            if side == "over":
+                if dr_rank >= 25:   adj = +8; adjustments.append(f"rival def débil +8")
+                elif dr_rank >= 20: adj = +4; adjustments.append(f"rival def floja +4")
+                elif dr_rank <= 5:  adj = -8; adjustments.append(f"rival def élite -8")
+                elif dr_rank <= 10: adj = -4; adjustments.append(f"rival def buena -4")
+                else: adj = 0
+            else:  # under
+                if dr_rank <= 5:    adj = +8; adjustments.append(f"rival def élite +8")
+                elif dr_rank <= 10: adj = +4; adjustments.append(f"rival def buena +4")
+                elif dr_rank >= 25: adj = -8; adjustments.append(f"rival def débil -8")
+                elif dr_rank >= 20: adj = -4; adjustments.append(f"rival def floja -4")
+                else: adj = 0
+            adj_total += adj
+
+        # Pace
+        if pace_rank:
+            if side == "over":
+                if pace_rank <= 5:   adj = +5; adjustments.append(f"ritmo alto +5")
+                elif pace_rank >= 25: adj = -5; adjustments.append(f"ritmo lento -5")
+                else: adj = 0
+            else:
+                if pace_rank >= 25:  adj = +5; adjustments.append(f"ritmo lento +5")
+                elif pace_rank <= 5:  adj = -5; adjustments.append(f"ritmo alto -5")
+                else: adj = 0
+            adj_total += adj
+
+        # Stat específica permitida
+        if osr:
+            if side == "over":
+                if osr <= 8:    adj = +6; adjustments.append(f"rival permite muchos {tipo} +6")
+                elif osr >= 23: adj = -6; adjustments.append(f"rival limita {tipo} -6")
+                else: adj = 0
+            else:
+                if osr >= 23:   adj = +6; adjustments.append(f"rival limita {tipo} +6")
+                elif osr <= 8:  adj = -6; adjustments.append(f"rival permite muchos {tipo} -6")
+                else: adj = 0
+            adj_total += adj
+
+        meta["ctx_def_rank"]  = dr_rank
+        meta["ctx_pace_rank"] = pace_rank
+        meta["ctx_opp_stat"]  = opp_stat
+        meta["ctx_osr"]       = osr
+        meta["ctx_opp_tri"]   = opp_tricode
+
+    # ── Ajuste 2: split H/A ──
+    splits = home_away_splits(pid, tipo)
+    loc = "home" if is_home else "away"
+    loc_avg = splits.get(f"{loc}_avg")
+    if loc_avg is not None:
+        gap = loc_avg - line if side == "over" else line - loc_avg
+        if gap > 2.0:   adj = +5; adjustments.append(f"split {loc} favorable +5")
+        elif gap < -2.0: adj = -5; adjustments.append(f"split {loc} desfavorable -5")
+        else: adj = 0
+        adj_total += adj
+        meta["ha_split_avg"] = loc_avg
+        meta["ha_loc"] = loc
+
+    # ── Ajuste 3: rest days ──
+    if rest_days == 0:    # back-to-back
+        adj = -6 if side == "over" else +6
+        adjustments.append(f"back-to-back {adj:+d}")
+        adj_total += adj
+    elif rest_days >= 3:  # bien descansado
+        adj = +4 if side == "over" else -4
+        adjustments.append(f"bien descansado {adj:+d}")
+        adj_total += adj
+
+    final = int(clamp(base_score + adj_total, 0, 100))
+    meta["v2_base"]        = base_score
+    meta["v2_adj"]         = round(adj_total, 1)
+    meta["v2_adjustments"] = adjustments
+    return final, meta
+
+
+def _compute_pre_v2_for_player(player_name: str, tipo: str, line: float,
+                                source: str, opp_tricode: str, is_home: bool) -> dict:
+    """Versión v2 de _compute_pre_for_player con contexto defensivo."""
+    pid = get_pid_for_name(player_name)
+    if not pid:
+        return {"tipo": tipo, "line": line, "source": source,
+                "pre_over": 0, "pre_under": 0, "meta_over": {}, "pid": None}
+
+    # Rest days
+    rest = 1
+    try:
+        headers, rows = get_gamelog_table(pid)
+        if headers and rows:
+            from datetime import datetime, timedelta
+            date_idx = headers.index("GAME_DATE") if "GAME_DATE" in headers else -1
+            if date_idx >= 0 and rows:
+                last_str = str(rows[0][date_idx])
+                last_d   = datetime.strptime(last_str, "%b %d, %Y").date()
+                rest = (date.today() - last_d).days
+    except Exception:
+        pass
+
+    po, meta_o = pre_score_v2(pid, tipo, line, "over",  opp_tricode, is_home, rest)
+    pu, _      = pre_score_v2(pid, tipo, line, "under", opp_tricode, is_home, rest)
+
+    # Cache
+    cache_key = _pre_cache_key(pid, tipo, line)
+    PRE_SCORE_CACHE[cache_key] = (po, pu, meta_o)
+
+    return {"tipo": tipo, "line": line, "source": source,
+            "pre_over": po, "pre_under": pu, "meta_over": meta_o, "pid": pid}
+
+
+def _enrich_game_message(slug: str, players_data: Dict[str, List[dict]]) -> str:
+    """
+    Igual que _build_game_message pero añade ajuste v2 y contexto defensivo
+    en cada línea del jugador.
+    """
+    tipo_order = {"puntos": 0, "rebotes": 1, "asistencias": 2}
+    tipo_icon  = {"puntos": "🏀", "rebotes": "💪", "asistencias": "🎯"}
+
+    matchup = _slug_to_matchup(slug)
+    lines   = [f"🟣 *{matchup}*\n`{slug}`\n{'─'*28}"]
+
+    def best_score(entries):
+        return max((max(e["pre_over"], e["pre_under"]) for e in entries), default=0)
+
+    for pl in sorted(players_data.keys(), key=lambda p: best_score(players_data[p]), reverse=True):
+        entries = sorted(players_data[pl], key=lambda e: tipo_order.get(e["tipo"], 9))
+        lines.append(f"\n👤 *{pl}*")
+
+        for e in entries:
+            tipo = e["tipo"]
+            ln   = e["line"]
+            po   = e["pre_over"]
+            pu   = e["pre_under"]
+            icon = tipo_icon.get(tipo, "•")
+            meta = e.get("meta_over", {})
+
+            h5    = meta.get("hits5",  "?")
+            n5    = meta.get("n5",     "?")
+            h10   = meta.get("hits10", "?")
+            n10   = meta.get("n10",    "?")
+            avg10 = meta.get("avg10",  None)
+            avg_str = f"prom `{avg10:.1f}`" if avg10 is not None else ""
+
+            # Ajustes v2
+            base     = meta.get("v2_base", po)
+            adj      = meta.get("v2_adj",  0)
+            adj_sign = f"+{adj}" if adj >= 0 else str(adj)
+            adj_str  = f"  _(base {base} {adj_sign} ctx)_\n" if adj != 0 else ""
+
+            # Contexto defensivo resumido
+            ctx_dr  = meta.get("ctx_def_rank")
+            ctx_pr  = meta.get("ctx_pace_rank")
+            ctx_osr = meta.get("ctx_osr")
+            ctx_parts = []
+            if ctx_dr:  ctx_parts.append(f"Def#{ctx_dr}")
+            if ctx_pr:  ctx_parts.append(f"Pace#{ctx_pr}")
+            if ctx_osr: ctx_parts.append(f"{tipo[:3].capitalize()}Allow#{ctx_osr}")
+            ctx_line = f"  🛡️ `{' · '.join(ctx_parts)}`\n" if ctx_parts else ""
+
+            lines.append(
+                f"{icon} *{tipo.upper()}* — `{ln}`\n"
+                f"  OVER  {_pre_rating_emoji(po)} `{po:>3}/100` {_pre_bar(po)} _{_pre_label(po)}_\n"
+                f"  UNDER {_pre_rating_emoji(pu)} `{pu:>3}/100` {_pre_bar(pu)} _{_pre_label(pu)}_\n"
+                f"{adj_str}"
+                f"  📊 `{h5}/{n5}` últ5 | `{h10}/{n10}` últ10  {avg_str}\n"
+                f"{ctx_line}"
+            )
+
+    return "\n".join(lines)
+
+
+# ================================================================
+# BLOQUE C — RESUMEN MATUTINO AUTOMÁTICO
+# ================================================================
+
+MORNING_DIGEST_HOUR = int(os.environ.get("MORNING_HOUR", "10"))  # hora local
+MORNING_DIGEST_FILE = "morning_digest_state.json"
+
+def load_morning_state() -> dict:
+    return load_json(MORNING_DIGEST_FILE, {})
+
+def save_morning_state(st: dict):
+    save_json(MORNING_DIGEST_FILE, st)
+
+async def send_morning_digest(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Job: envía resumen matutino automático con
+    - Partidos del día
+    - Injury report rápido
+    - Top 5 props recomendadas (PRE v2)
+    """
+    chat_id = context.job.chat_id
+    today   = date.today().isoformat()
+
+    # Verificar que no se haya enviado ya hoy
+    state = load_morning_state()
+    if state.get("last_date") == today:
+        return
+    state["last_date"] = today
+    save_morning_state(state)
+
+    try:
+        games = await asyncio.to_thread(
+            lambda: scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"]
+        )
+    except Exception as e:
+        log.warning(f"Morning digest: error scoreboard: {e}")
+        return
+
+    if not games:
+        return
+
+    today_fmt = date.today().strftime("%A %d/%m/%Y").capitalize()
+    header = (
+        f"🌅 *RESUMEN MATUTINO NBA*\n"
+        f"_{today_fmt}_\n"
+        f"{'─'*32}"
+    )
+
+    # ── Partidos del día ──
+    game_lines = ["\n🏀 *PARTIDOS HOY:*"]
+    for g in games:
+        away = g.get("awayTeam", {})
+        home = g.get("homeTeam", {})
+        at   = away.get("teamTricode","?")
+        ht   = home.get("teamTricode","?")
+        aw   = away.get("wins",0); al = away.get("losses",0)
+        hw   = home.get("wins",0); hl = home.get("losses",0)
+        st   = g.get("gameStatusText","")
+        game_lines.append(f"  • *{at}* ({aw}-{al}) @ *{ht}* ({hw}-{hl}) — _{st}_")
+
+    # ── Injury report rápido (solo bajas confirmadas) ──
+    injury_lines = ["\n🏥 *INJURY REPORT:*"]
+    injury_found = False
+    for g in games[:4]:  # limitamos para no tardar mucho
+        gid = g.get("gameId","")
+        at  = (g.get("awayTeam") or {}).get("teamTricode","")
+        ht  = (g.get("homeTeam") or {}).get("teamTricode","")
+        if not gid:
+            continue
+        try:
+            box_data = await asyncio.to_thread(fetch_boxscore_injury_data, gid)
+            for tri in [at, ht]:
+                pls = box_data.get(tri, [])
+                out_pls = [p for p in pls
+                           if p.get("status","").lower() in ("inactive","out")
+                           and p.get("not_playing_reason","")]
+                if out_pls:
+                    injury_found = True
+                    names = ", ".join(
+                        f"*{p['name']}* _{p.get('not_playing_reason','')[:20]}_"
+                        for p in out_pls[:3]
+                    )
+                    injury_lines.append(f"  🔴 {tri}: {names}")
+        except Exception:
+            pass
+
+    if not injury_found:
+        injury_lines.append("  ✅ Sin bajas confirmadas (datos tempranos)")
+
+    # ── Top 5 props del día ──
+    props_lines = ["\n🏆 *TOP 5 PROPS RECOMENDADAS:*"]
+    try:
+        props_pm = await asyncio.to_thread(polymarket_props_today_from_scoreboard)
+        props_over = [p for p in props_pm if p.side == "over"][:40]  # limitar
+
+        # Obtener rival para cada prop desde el slug
+        def _get_opp(p: Prop) -> Tuple[str, bool]:
+            parts = (p.game_slug or "").replace("nba-","").split("-")
+            return (parts[1].upper() if len(parts) >= 2 else "", False)
+
+        sem = asyncio.Semaphore(3)
+
+        async def _score_prop(p: Prop):
+            async with sem:
+                opp, is_home = _get_opp(p)
+                try:
+                    entry = await asyncio.wait_for(
+                        asyncio.to_thread(_compute_pre_v2_for_player,
+                                          p.player, p.tipo, p.line, p.source, opp, is_home),
+                        timeout=20.0
+                    )
+                    return p, entry.get("pre_over", 0), entry.get("meta_over", {})
+                except Exception:
+                    return p, 0, {}
+
+        scored = await asyncio.gather(*[_score_prop(p) for p in props_over])
+        scored = [(pr, sc, mt) for pr, sc, mt in scored if sc >= 60]
+        scored.sort(key=lambda x: x[1], reverse=True)
+
+        tipo_icon = {"puntos":"🏀","rebotes":"💪","asistencias":"🎯"}
+        for i, (prop, score, meta) in enumerate(scored[:5], 1):
+            matchup  = _slug_to_matchup(prop.game_slug or "")
+            avg10    = meta.get("avg10")
+            avg_str  = f"prom `{avg10:.1f}`" if avg10 else ""
+            adjs     = meta.get("v2_adjustments", [])
+            adj_str  = f" · _{', '.join(adjs[:2])}_" if adjs else ""
+            icon     = tipo_icon.get(prop.tipo,"•")
+            props_lines.append(
+                f"  *{i}.* {_pre_rating_emoji(score)} `{score}/100` "
+                f"— *{prop.player}*\n"
+                f"     {icon} {prop.tipo.upper()} OVER `{prop.line}` _{matchup}_\n"
+                f"     {avg_str}{adj_str}"
+            )
+    except Exception as e:
+        log.warning(f"Morning digest props: {e}")
+        props_lines.append("  _Sin datos de props disponibles_")
+
+    footer = (
+        f"\n{'─'*32}\n"
+        f"_Usa /odds para ver todas · /lineup para alineaciones_"
+    )
+
+    full_msg = header + "\n".join(game_lines) + "\n".join(injury_lines) + "\n".join(props_lines) + footer
+    if len(full_msg) > 3900:
+        full_msg = full_msg[:3900] + "\n…"
+
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=full_msg, parse_mode=ParseMode.MARKDOWN)
+        log.info(f"Morning digest enviado a {chat_id}")
+    except Exception as e:
+        log.warning(f"Error enviando morning digest: {e}")
+
+
+async def background_check_morning(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Job que corre cada hora y dispara el digest matutino
+    cuando es la hora configurada.
+    """
+    from datetime import datetime
+    current_hour = datetime.now().hour
+    if current_hour == MORNING_DIGEST_HOUR:
+        await send_morning_digest(context)
+
+
+# ================================================================
+# BLOQUE D — AUTO-RESOLUCIÓN DE APUESTAS
+# ================================================================
+
+async def background_autoresolve_bets(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Job periódico: busca apuestas pendientes y las resuelve automáticamente
+    cuando el partido ya terminó (gameStatus == 3).
+    """
+    chat_id = context.job.chat_id
+    bets    = load_bets()
+    pending = [b for b in bets if not b.result]
+    if not pending:
+        return
+
+    try:
+        games = await asyncio.to_thread(
+            lambda: scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"]
+        )
+    except Exception:
+        return
+
+    # Índice de partidos finalizados: slug → game_id
+    finished: Dict[str, str] = {}
+    for g in games:
+        if g.get("gameStatus") == 3:
+            slug = _slug_from_scoreboard_game(g)
+            finished[slug] = g.get("gameId","")
+
+    if not finished:
+        return
+
+    resolved_any = False
+    for bet in pending:
+        if bet.game_slug not in finished:
+            continue
+
+        gid = finished[bet.game_slug]
+        try:
+            box = await asyncio.to_thread(
+                lambda gid=gid: boxscore.BoxScore(gid).get_dict()["game"]
+            )
+        except Exception:
+            continue
+
+        # Buscar el jugador en el boxscore final
+        pid = get_pid_for_name(bet.player)
+        actual_stat: Optional[float] = None
+
+        for team_key in ["homeTeam", "awayTeam"]:
+            for pl in box.get(team_key, {}).get("players", []):
+                if pl.get("personId") == pid:
+                    s = pl.get("statistics", {})
+                    stat_map = {
+                        "puntos":     float(s.get("points",0) or 0),
+                        "rebotes":    float(s.get("reboundsTotal",0) or 0),
+                        "asistencias":float(s.get("assists",0) or 0),
+                    }
+                    actual_stat = stat_map.get(bet.tipo)
+                    break
+            if actual_stat is not None:
+                break
+
+        if actual_stat is None:
+            continue
+
+        # Determinar resultado
+        if bet.side == "over":
+            result = "win" if actual_stat > bet.line else ("push" if actual_stat == bet.line else "loss")
+        else:
+            result = "win" if actual_stat < bet.line else ("push" if actual_stat == bet.line else "loss")
+
+        bet.result       = result
+        bet.actual_stat  = actual_stat
+        bet.resolved_at  = now_ts()
+        resolved_any     = True
+
+        emoji = {"win":"✅","loss":"❌","push":"🔁"}.get(result,"❓")
+        tipo_icon = {"puntos":"🏀","rebotes":"💪","asistencias":"🎯"}.get(bet.tipo,"•")
+        msg = (
+            f"🤖 *AUTO-RESULTADO* `#{bet.id}`\n"
+            f"👤 *{bet.player}*  {tipo_icon} {bet.tipo.upper()} "
+            f"{bet.side.upper()} `{bet.line}`\n"
+            f"📊 Real: `{actual_stat:.0f}` → {emoji} *{result.upper()}*\n"
+            f"💰 `{bet.amount}` unidades"
+        )
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            log.warning(f"Auto-resolve send error: {e}")
+
+    if resolved_any:
+        save_bets(bets)
+
+
+# ================================================================
+# COMANDO /contexto — ver contexto defensivo de un partido
+# ================================================================
+
+async def cmd_contexto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /contexto BOS DEN — contexto defensivo, pace y stats permitidas
+    de ambos equipos para el partido de hoy.
+    """
+    args = context.args or []
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Uso: `/contexto AWAY HOME`\nEj: `/contexto BOS DEN`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    away_tri = args[0].upper()
+    home_tri = args[1].upper()
+
+    msg_wait = await update.message.reply_text(
+        f"⏳ Cargando contexto *{away_tri} @ {home_tri}*...",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    def _fetch():
+        ts   = fetch_league_team_stats()
+        _    = fetch_opp_position_stats()
+        away = {
+            "ctx_pts":  get_defensive_context(home_tri, "puntos"),
+            "ctx_reb":  get_defensive_context(home_tri, "rebotes"),
+            "ctx_ast":  get_defensive_context(home_tri, "asistencias"),
+        }
+        home = {
+            "ctx_pts":  get_defensive_context(away_tri, "puntos"),
+            "ctx_reb":  get_defensive_context(away_tri, "rebotes"),
+            "ctx_ast":  get_defensive_context(away_tri, "asistencias"),
+        }
+        return away, home
+
+    away_ctx, home_ctx = await asyncio.to_thread(_fetch)
+
+    def _fmt_team(tri: str, ctx_dict: dict, label: str) -> str:
+        lines = [f"*{label} — {tri} (defensivamente)*"]
+        for tipo, key in [("Puntos","ctx_pts"),("Rebotes","ctx_reb"),("Asistencias","ctx_ast")]:
+            ctx = ctx_dict[key]
+            dr  = ctx.get("def_rating"); dr_r = ctx.get("def_rank","?")
+            pr  = ctx.get("pace");       pr_r = ctx.get("pace_rank","?")
+            os  = ctx.get("opp_stat");   osr  = ctx.get("opp_stat_rank","?")
+            os_str = f"`{os:.1f}` (rank #{osr})" if os else "—"
+            lines.append(
+                f"  🏷️ *{tipo}* permitidos: {os_str}\n"
+                f"     Def Rating `{dr:.1f}` #{dr_r} · Pace `{pr:.1f}` #{pr_r}\n"
+                f"     _{ctx.get('verdict','')}_"
+            )
+        return "\n".join(lines)
+
+    away_block = _fmt_team(home_tri, away_ctx, "Defensa del rival de los visitantes")
+    home_block = _fmt_team(away_tri, home_ctx, "Defensa del rival de los locales")
+
+    full = (
+        f"🛡️ *CONTEXTO: {away_tri} @ {home_tri}*\n{'─'*30}\n\n"
+        f"{away_block}\n\n{'─'*30}\n\n{home_block}\n\n"
+        f"_Rank #1 = mejor defensa / permite menos_"
+    )
+
+    if len(full) > 3900:
+        full = full[:3900] + "\n…"
+    await msg_wait.edit_text(full, parse_mode=ParseMode.MARKDOWN)
+
+
 # =========================
 # Main
 # =========================
+# ================================================================
+# SISTEMA MULTI-USUARIO
+# ================================================================
+
+USERS_FILE = "users.json"
+
+# Si defines ADMIN_ID en Railway, ese user_id es el admin automáticamente.
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+
+def load_users() -> dict:
+    """
+    Estructura: {
+      "allowed": [user_id, ...],       # usuarios autorizados
+      "admins":  [user_id, ...],       # pueden /adduser /removeuser
+      "nicknames": {user_id: name}     # nombres amigables
+    }
+    """
+    return load_json(USERS_FILE, {"allowed": [], "admins": [], "nicknames": {}})
+
+def save_users(data: dict):
+    save_json(USERS_FILE, data)
+
+def is_allowed(user_id: int) -> bool:
+    """¿Está autorizado este usuario?"""
+    users = load_users()
+    # Si no hay nadie en la lista, el primero que arranque es libre
+    if not users["allowed"] and not users["admins"]:
+        return True
+    return user_id in users["allowed"] or user_id in users["admins"] or user_id == ADMIN_ID
+
+def is_admin(user_id: int) -> bool:
+    users = load_users()
+    return user_id in users["admins"] or user_id == ADMIN_ID
+
+def add_user(user_id: int, nickname: str = "", admin: bool = False) -> bool:
+    users = load_users()
+    if user_id not in users["allowed"]:
+        users["allowed"].append(user_id)
+    if admin and user_id not in users["admins"]:
+        users["admins"].append(user_id)
+    if nickname:
+        users["nicknames"][str(user_id)] = nickname
+    save_users(users)
+    return True
+
+def remove_user(user_id: int) -> bool:
+    users = load_users()
+    if user_id in users["allowed"]:
+        users["allowed"].remove(user_id)
+    if user_id in users["admins"]:
+        users["admins"].remove(user_id)
+    users["nicknames"].pop(str(user_id), None)
+    save_users(users)
+    return True
+
+def user_display(user_id: int) -> str:
+    users = load_users()
+    nick = users["nicknames"].get(str(user_id))
+    return nick if nick else f"#{user_id}"
+
+async def guard(update: Update) -> bool:
+    """
+    Middleware de autorización. Retorna True si el usuario puede continuar.
+    Si no, le explica cómo solicitar acceso.
+    """
+    uid = update.effective_user.id if update.effective_user else 0
+    if is_allowed(uid):
+        return True
+    uname = update.effective_user.username or update.effective_user.first_name or str(uid)
+    await update.message.reply_text(
+        f"🔒 *Acceso restringido*\n\n"
+        f"Tu ID es: `{uid}`\n"
+        f"Pide al admin que ejecute:\n"
+        f"`/adduser {uid} TuNombre`",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    log.info(f"Acceso denegado a @{uname} (id={uid})")
+    return False
+
+# Comandos de gestión de usuarios
+async def cmd_adduser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Solo admins. /adduser USER_ID Nombre"""
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ Solo los admins pueden hacer esto.")
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text(
+            "Uso: `/adduser USER_ID Nombre`\n"
+            "Ej: `/adduser 123456789 Carlos`\n\n"
+            "_El user puede encontrar su ID arrancando el bot_",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    try:
+        target_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("El ID debe ser un número.")
+        return
+
+    nickname = " ".join(args[1:]) if len(args) > 1 else ""
+    add_user(target_id, nickname)
+    nick_str = f" (*{nickname}*)" if nickname else ""
+    await update.message.reply_text(
+        f"✅ Usuario `{target_id}`{nick_str} añadido.\n"
+        f"Que ejecute `/start` en el bot para activar.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def cmd_removeuser(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Solo admins. /removeuser USER_ID"""
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ Solo los admins pueden hacer esto.")
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Uso: `/removeuser USER_ID`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    try:
+        target_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("El ID debe ser un número.")
+        return
+
+    remove_user(target_id)
+    await update.message.reply_text(f"✅ Usuario `{target_id}` eliminado.", parse_mode=ParseMode.MARKDOWN)
+
+async def cmd_usuarios(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Solo admins. Lista todos los usuarios autorizados."""
+    uid = update.effective_user.id if update.effective_user else 0
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ Solo los admins pueden hacer esto.")
+        return
+
+    users = load_users()
+    lines = ["👥 *Usuarios autorizados:*\n"]
+
+    for u_id in users.get("allowed", []):
+        nick   = users["nicknames"].get(str(u_id), "—")
+        is_adm = "👑 " if u_id in users.get("admins", []) else "• "
+        lines.append(f"{is_adm}`{u_id}` — {nick}")
+
+    if ADMIN_ID and ADMIN_ID not in users.get("allowed", []):
+        lines.append(f"👑 `{ADMIN_ID}` — Admin (env)")
+
+    if len(lines) == 1:
+        lines.append("_Sin usuarios registrados aún_")
+
+    lines.append(f"\n_Total: {len(users.get('allowed',[]))} usuarios_")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+async def cmd_miperfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra el ID y perfil del usuario actual."""
+    if not await guard(update): return
+    uid   = update.effective_user.id if update.effective_user else 0
+    uname = update.effective_user.username or "—"
+    fname = update.effective_user.first_name or "—"
+    nick  = user_display(uid)
+    adm   = "👑 Admin" if is_admin(uid) else "👤 Usuario"
+
+    bets  = load_bets()
+    mine  = [b for b in bets if b.user_id == uid]
+    won   = sum(1 for b in mine if b.result == "win")
+    lost  = sum(1 for b in mine if b.result == "loss")
+    pend  = sum(1 for b in mine if not b.result)
+
+    await update.message.reply_text(
+        f"👤 *Mi perfil*\n"
+        f"{'─'*24}\n"
+        f"ID: `{uid}`\n"
+        f"Username: @{uname}\n"
+        f"Nombre: {fname}\n"
+        f"Alias en el bot: *{nick}*\n"
+        f"Rol: {adm}\n\n"
+        f"📊 *Apuestas:* {won}W / {lost}L / {pend} pendientes\n"
+        f"_Usa `/historial` para estadísticas completas_",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+# ================================================================
+# MENÚ DE COMANDOS (se muestra en Telegram como lista desplegable)
+# ================================================================
+
+BOT_COMMANDS = [
+    BotCommand("start",       "Activar el bot y todos los jobs"),
+    BotCommand("games",       "Partidos NBA de hoy"),
+    BotCommand("odds",        "Props con score PRE (todas)"),
+    BotCommand("alertas",     "Top props recomendadas hoy"),
+    BotCommand("live",        "Props en vivo con scoring"),
+    BotCommand("lineup",      "Alineaciones + injury report"),
+    BotCommand("analisis",    "Análisis profundo de un prop"),
+    BotCommand("contexto",    "Contexto defensivo de un partido"),
+    BotCommand("bet",         "Registrar apuesta"),
+    BotCommand("misapuestas", "Ver apuestas pendientes"),
+    BotCommand("historial",   "ROI y estadísticas de apuestas"),
+    BotCommand("resultado",   "Cerrar apuesta manualmente"),
+    BotCommand("miperfil",    "Ver mi ID y perfil"),
+    BotCommand("help",        "Lista de comandos"),
+]
+
+BOT_COMMANDS_ADMIN = BOT_COMMANDS + [
+    BotCommand("adduser",    "Añadir usuario autorizado"),
+    BotCommand("removeuser", "Eliminar usuario"),
+    BotCommand("usuarios",   "Ver todos los usuarios"),
+    BotCommand("debug",      "Estado técnico Polymarket"),
+    BotCommand("add",        "Añadir prop manual"),
+]
+
+# ================================================================
+# STARTUP & REGISTER
+# ================================================================
+
 async def on_startup(app: Application):
+    """Registra los comandos en Telegram al arrancar (aparece el menú /)"""
+    try:
+        await app.bot.set_my_commands(BOT_COMMANDS)
+        log.info("Comandos registrados en Telegram ✅")
+    except Exception as e:
+        log.warning(f"Error registrando comandos: {e}")
     log.info("Bot arrancado.")
+
+async def register_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid     = update.effective_user.id if update.effective_user else 0
+    uname   = update.effective_user.first_name or str(uid)
+    chat_id = update.effective_chat.id
+
+    # Primera vez que alguien usa /start → auto-añadir como usuario
+    users = load_users()
+    if not users["allowed"] and not users["admins"]:
+        # Es el primer usuario → hacerlo admin
+        add_user(uid, uname, admin=True)
+        await update.message.reply_text(
+            f"👑 *Eres el primer usuario — se te asignó rol Admin*\n"
+            f"Tu ID: `{uid}`\n"
+            f"Puedes añadir amigos con `/adduser ID Nombre`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    elif not is_allowed(uid):
+        await update.message.reply_text(
+            f"🔒 *Acceso restringido*\n\n"
+            f"Tu ID: `{uid}`\n"
+            f"Pide al admin:\n`/adduser {uid} {uname}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    else:
+        add_user(uid, uname)  # actualizar nickname si cambió
+
+    # Job 1: scan en vivo
+    if not context.job_queue.get_jobs_by_name(f"scan:{chat_id}"):
+        context.job_queue.run_repeating(
+            background_scan, interval=POLL_SECONDS, first=5,
+            chat_id=chat_id, name=f"scan:{chat_id}",
+        )
+
+    # Job 2: alertas pre-partido
+    if not context.job_queue.get_jobs_by_name(f"smart:{chat_id}"):
+        context.job_queue.run_repeating(
+            background_smart_alerts, interval=30*60, first=20,
+            chat_id=chat_id, name=f"smart:{chat_id}",
+        )
+
+    # Job 3: resumen matutino
+    if not context.job_queue.get_jobs_by_name(f"morning:{chat_id}"):
+        context.job_queue.run_repeating(
+            background_check_morning, interval=60*60, first=60,
+            chat_id=chat_id, name=f"morning:{chat_id}",
+        )
+
+    # Job 4: auto-resolución de apuestas
+    if not context.job_queue.get_jobs_by_name(f"autoresolve:{chat_id}"):
+        context.job_queue.run_repeating(
+            background_autoresolve_bets, interval=20*60, first=120,
+            chat_id=chat_id, name=f"autoresolve:{chat_id}",
+        )
+
+    await update.message.reply_text(
+        f"✅ *¡Bienvenido, {uname}!*\n"
+        f"Todos los jobs activados.\n\n"
+        f"Toca el 📎 menú o escribe `/` para ver los comandos disponibles.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    await cmd_help(update, context)
+
+def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # ── Wrapper de autorización para todos los comandos ──
+    def guarded(fn):
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            if not await guard(update):
+                return
+            return await fn(update, context)
+        wrapper.__name__ = fn.__name__
+        return wrapper
+
+    # Principales (con guard)
+    app.add_handler(CommandHandler("start",        register_job))   # guard interno
+    app.add_handler(CommandHandler("help",         guarded(cmd_help)))
+    app.add_handler(CommandHandler("games",        guarded(cmd_games)))
+    app.add_handler(CommandHandler("today",        guarded(cmd_games)))
+    app.add_handler(CommandHandler("odds",         guarded(cmd_odds)))
+    app.add_handler(CommandHandler("live",         guarded(cmd_live)))
+    app.add_handler(CommandHandler("lineup",       guarded(cmd_lineup)))
+
+    # Análisis
+    app.add_handler(CommandHandler("analisis",     guarded(cmd_analisis)))
+    app.add_handler(CommandHandler("alertas",      guarded(cmd_alertas)))
+    app.add_handler(CommandHandler("contexto",     guarded(cmd_contexto)))
+
+    # Apuestas
+    app.add_handler(CommandHandler("bet",          guarded(cmd_bet)))
+    app.add_handler(CommandHandler("resultado",    guarded(cmd_resultado)))
+    app.add_handler(CommandHandler("historial",    guarded(cmd_historial)))
+    app.add_handler(CommandHandler("misapuestas",  guarded(cmd_misapuestas)))
+
+    # Perfil
+    app.add_handler(CommandHandler("miperfil",     guarded(cmd_miperfil)))
+
+    # Admin
+    app.add_handler(CommandHandler("adduser",      cmd_adduser))
+    app.add_handler(CommandHandler("removeuser",   cmd_removeuser))
+    app.add_handler(CommandHandler("usuarios",     cmd_usuarios))
+    app.add_handler(CommandHandler("debug",        guarded(cmd_debug)))
+    app.add_handler(CommandHandler("add",          guarded(cmd_add)))
+
+    app.post_init = on_startup
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
 
 async def register_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
 
-    # Job: scan en vivo
+    # Job 1: scan en vivo (cada POLL_SECONDS)
     if not context.job_queue.get_jobs_by_name(f"scan:{chat_id}"):
         context.job_queue.run_repeating(
-            background_scan,
-            interval=POLL_SECONDS,
-            first=5,
-            chat_id=chat_id,
-            name=f"scan:{chat_id}",
+            background_scan, interval=POLL_SECONDS, first=5,
+            chat_id=chat_id, name=f"scan:{chat_id}",
         )
         await update.message.reply_text(f"✅ Scan en vivo activado (cada {POLL_SECONDS}s).")
 
-    # Job: alertas pre-partido (cada 30 min)
+    # Job 2: alertas pre-partido (cada 30 min)
     if not context.job_queue.get_jobs_by_name(f"smart:{chat_id}"):
         context.job_queue.run_repeating(
-            background_smart_alerts,
-            interval=30 * 60,
-            first=15,
-            chat_id=chat_id,
-            name=f"smart:{chat_id}",
+            background_smart_alerts, interval=30*60, first=15,
+            chat_id=chat_id, name=f"smart:{chat_id}",
         )
-        await update.message.reply_text("✅ Alertas pre-partido activadas (cada 30min).")
+        await update.message.reply_text("✅ Alertas pre-partido activadas.")
+
+    # Job 3: resumen matutino (check cada hora)
+    if not context.job_queue.get_jobs_by_name(f"morning:{chat_id}"):
+        context.job_queue.run_repeating(
+            background_check_morning, interval=60*60, first=30,
+            chat_id=chat_id, name=f"morning:{chat_id}",
+        )
+        await update.message.reply_text(f"✅ Resumen matutino activado (a las {MORNING_DIGEST_HOUR}:00h).")
+
+    # Job 4: auto-resolución de apuestas (cada 20 min)
+    if not context.job_queue.get_jobs_by_name(f"autoresolve:{chat_id}"):
+        context.job_queue.run_repeating(
+            background_autoresolve_bets, interval=20*60, first=60,
+            chat_id=chat_id, name=f"autoresolve:{chat_id}",
+        )
+        await update.message.reply_text("✅ Auto-resolución de apuestas activada.")
 
     await cmd_help(update, context)
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Comandos principales
-    app.add_handler(CommandHandler("start",       register_job))
-    app.add_handler(CommandHandler("help",        cmd_help))
-    app.add_handler(CommandHandler("games",       cmd_games))
-    app.add_handler(CommandHandler("today",       cmd_games))
-    app.add_handler(CommandHandler("odds",        cmd_odds))
-    app.add_handler(CommandHandler("live",        cmd_live))
-    app.add_handler(CommandHandler("lineup",      cmd_lineup))
-    app.add_handler(CommandHandler("debug",       cmd_debug))
+    # Principales
+    app.add_handler(CommandHandler("start",        register_job))
+    app.add_handler(CommandHandler("help",         cmd_help))
+    app.add_handler(CommandHandler("games",        cmd_games))
+    app.add_handler(CommandHandler("today",        cmd_games))
+    app.add_handler(CommandHandler("odds",         cmd_odds))
+    app.add_handler(CommandHandler("live",         cmd_live))
+    app.add_handler(CommandHandler("lineup",       cmd_lineup))
+    app.add_handler(CommandHandler("debug",        cmd_debug))
 
     # Análisis avanzado
-    app.add_handler(CommandHandler("analisis",    cmd_analisis))
-    app.add_handler(CommandHandler("alertas",     cmd_alertas))
+    app.add_handler(CommandHandler("analisis",     cmd_analisis))
+    app.add_handler(CommandHandler("alertas",      cmd_alertas))
+    app.add_handler(CommandHandler("contexto",     cmd_contexto))
 
     # Tracking de apuestas
-    app.add_handler(CommandHandler("bet",         cmd_bet))
-    app.add_handler(CommandHandler("resultado",   cmd_resultado))
-    app.add_handler(CommandHandler("historial",   cmd_historial))
-    app.add_handler(CommandHandler("misapuestas", cmd_misapuestas))
+    app.add_handler(CommandHandler("bet",          cmd_bet))
+    app.add_handler(CommandHandler("resultado",    cmd_resultado))
+    app.add_handler(CommandHandler("historial",    cmd_historial))
+    app.add_handler(CommandHandler("misapuestas",  cmd_misapuestas))
 
     # Manual
-    app.add_handler(CommandHandler("add",         cmd_add))
+    app.add_handler(CommandHandler("add",          cmd_add))
 
     app.post_init = on_startup
     app.run_polling(allowed_updates=Update.ALL_TYPES)
