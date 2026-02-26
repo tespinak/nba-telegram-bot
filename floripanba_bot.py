@@ -23,7 +23,8 @@ from telegram.ext import (
 )
 
 from nba_api.live.nba.endpoints import scoreboard, boxscore
-from nba_api.stats.static import players
+from nba_api.stats.static import players, teams as nba_teams_static
+from nba_api.stats.endpoints import commonteamroster
 
 # =========================
 # CONFIG
@@ -921,13 +922,15 @@ def polymarket_props_today_from_scoreboard() -> List[Prop]:
 HELP_TEXT = (
     "🧠 *NBA Interactive Bot*\n\n"
     "Comandos:\n"
-    "• `/games`  → programación NBA de hoy\n"
-    "• `/today`  → alias de /games\n"
-    "• `/odds`   → props P/R/A de Polymarket (auto)\n"
-    "   - `/odds nba-okc-det-2026-02-25`  (solo ese partido)\n"
-    "   - `/odds Nikola Jokic`           (filtra por jugador)\n"
-    "• `/live`   → top props en vivo (auto) + scoring\n"
-    "• `/debug`  → info de debug de Polymarket\n\n"
+    "• `/games`   → programación NBA de hoy\n"
+    "• `/today`   → alias de /games\n"
+    "• `/odds`    → props P/R/A con score 1-100\n"
+    "   - `/odds nba-okc-det-2026-02-25` (un partido)\n"
+    "   - `/odds Nikola Jokic`           (un jugador)\n"
+    "• `/lineup`  → alineaciones + injury report + análisis\n"
+    "   - `/lineup BOS`  (filtrar por tricode de equipo)\n"
+    "• `/live`    → top props en vivo + scoring\n"
+    "• `/debug`   → info técnica de Polymarket\n\n"
     "Opcional manual:\n"
     "• `/add Nombre | tipo | side | linea`\n"
     "   Ej: `/add Jalen Duren | puntos | over | 15.5`\n"
@@ -1120,26 +1123,107 @@ def _slug_to_matchup(slug: str) -> str:
         return f"{away} @ {home}"
     return slug
 
+# =========================
+# PRE score cache (evita recalcular en /odds repetidos)
+# =========================
+PRE_SCORE_CACHE: Dict[str, Tuple[int, int, dict]] = {}  # key → (pre_over, pre_under, meta)
+PRE_SCORE_CACHE_TTL = 3 * 60 * 60  # 3 horas
+
+def _pre_cache_key(pid: int, tipo: str, line: float) -> str:
+    return f"{pid}:{tipo}:{line}"
+
+def pre_score_cached(pid: int, tipo: str, line: float) -> Tuple[int, int, dict]:
+    """Calcula PRE score over+under con cache en memoria."""
+    key = _pre_cache_key(pid, tipo, line)
+    if key in PRE_SCORE_CACHE:
+        return PRE_SCORE_CACHE[key]
+    po, meta_o = pre_score(pid, tipo, line, "over")
+    pu, _      = pre_score(pid, tipo, line, "under")
+    PRE_SCORE_CACHE[key] = (po, pu, meta_o)
+    return po, pu, meta_o
+
+def _compute_pre_for_player(player_name: str, tipo: str, line: float, source: str) -> dict:
+    """
+    Función bloqueante que calcula PRE score para un jugador.
+    Se ejecuta en un thread separado para no bloquear el event loop.
+    """
+    pid = get_pid_for_name(player_name)
+    if not pid:
+        return {
+            "tipo": tipo, "line": line, "source": source,
+            "pre_over": 0, "pre_under": 0, "meta_over": {},
+            "pid": None,
+        }
+    po, pu, meta = pre_score_cached(pid, tipo, line)
+    return {
+        "tipo": tipo, "line": line, "source": source,
+        "pre_over": po, "pre_under": pu, "meta_over": meta,
+        "pid": pid,
+    }
+
+def _build_game_message(slug: str, players_data: Dict[str, List[dict]]) -> str:
+    """Construye el mensaje formateado de un partido con sus props y scores."""
+    tipo_order = {"puntos": 0, "rebotes": 1, "asistencias": 2}
+    tipo_icon  = {"puntos": "🏀", "rebotes": "💪", "asistencias": "🎯"}
+
+    matchup = _slug_to_matchup(slug)
+    lines = [f"🟣 *{matchup}*\n`{slug}`\n{'─'*28}"]
+
+    def best_score(entries):
+        return max((max(e["pre_over"], e["pre_under"]) for e in entries), default=0)
+
+    players_sorted = sorted(players_data.keys(), key=lambda pl: best_score(players_data[pl]), reverse=True)
+
+    for pl in players_sorted:
+        entries = sorted(players_data[pl], key=lambda e: tipo_order.get(e["tipo"], 9))
+        lines.append(f"\n👤 *{pl}*")
+
+        for e in entries:
+            tipo = e["tipo"]
+            ln   = e["line"]
+            po   = e["pre_over"]
+            pu   = e["pre_under"]
+            icon = tipo_icon.get(tipo, "•")
+            meta = e.get("meta_over", {})
+
+            h5   = meta.get("hits5", "?")
+            n5   = meta.get("n5",    "?")
+            h10  = meta.get("hits10","?")
+            n10  = meta.get("n10",   "?")
+            avg10= meta.get("avg10", None)
+            avg_str = f"prom10: *{avg10:.1f}*" if avg10 is not None else ""
+
+            lines.append(
+                f"{icon} *{tipo.upper()}* — línea `{ln}`\n"
+                f"  OVER  {_pre_rating_emoji(po)} `{po:>3}/100` {_pre_bar(po)} _{_pre_label(po)}_\n"
+                f"  UNDER {_pre_rating_emoji(pu)} `{pu:>3}/100` {_pre_bar(pu)} _{_pre_label(pu)}_\n"
+                f"  📊 `{h5}/{n5}` últ.5 | `{h10}/{n10}` últ.10  {avg_str}"
+            )
+
+    return "\n".join(lines)
+
 async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tipo_order = {"puntos": 0, "rebotes": 1, "asistencias": 2}
+
     msg_loading = await update.message.reply_text(
-        "⏳ Cargando props y calculando scores...",
+        "⏳ *Cargando props de Polymarket...*",
         parse_mode=ParseMode.MARKDOWN
     )
 
-    props_pm = polymarket_props_today_from_scoreboard()
+    # ── 1. Cargar props (puede hacer requests a Polymarket) ──
+    props_pm = await asyncio.to_thread(polymarket_props_today_from_scoreboard)
+
     if not props_pm:
         await msg_loading.edit_text(
-            "❌ No pude obtener props de Polymarket ni del fallback.\n"
-            "Usa `/debug` para ver qué está pasando.\n"
-            "O agrega props manualmente con `/add`.",
+            "❌ No pude obtener props.\nUsa `/debug` o agrega con `/add`.",
             parse_mode=ParseMode.MARKDOWN
         )
         return
 
+    # ── 2. Filtros opcionales ──
     args = context.args or []
-    slug_filter = None
+    slug_filter   = None
     player_filter = None
-
     if args:
         q = " ".join(args).strip()
         if q.lower().startswith("nba-"):
@@ -1151,137 +1235,117 @@ async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if slug_filter:
         filtered = [p for p in props_pm if (p.game_slug or "").lower() == slug_filter]
         if not filtered:
+            slugs_avail = "\n".join(set(f"`{p.game_slug}`" for p in props_pm[:20]))
             await msg_loading.edit_text(
-                f"No encontré props para ese partido.\n`{slug_filter}`\n\n"
-                f"Slugs disponibles:\n" + "\n".join(set(f"`{p.game_slug}`" for p in props_pm[:20])),
+                f"❌ Sin props para `{slug_filter}`\n\nDisponibles:\n{slugs_avail}",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
-
     if player_filter:
         filtered = [p for p in props_pm if player_filter in (p.player or "").lower()]
         if not filtered:
             await msg_loading.edit_text(
-                f"No encontré props para ese jugador: `{player_filter}`",
+                f"❌ Sin props para jugador: `{player_filter}`",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
 
-    # Calcular PRE score para cada prop (solo over, el under es espejo)
-    # Estructura: player_name -> (tipo, line) -> (pre_over, pre_under, meta)
-    tipo_order = {"puntos": 0, "rebotes": 1, "asistencias": 2}
-    tipo_icon = {"puntos": "🏀", "rebotes": "💪", "asistencias": "🎯"}
-
-    # Agrupar props únicos: slug -> player -> (tipo, line) -> sides
-    # Además calculamos PRE para each
-    grouped_data: Dict[str, Dict[str, List[dict]]] = {}
-
-    # Primero agrupamos todos los props únicos (over+under juntos)
+    # ── 3. Agrupar props únicos por partido y jugador ──
+    # slug → player → lista de líneas únicas
+    grouped_unique: Dict[str, Dict[str, List[Tuple[str, float, str]]]] = {}
     seen_lines: set = set()
     for p in filtered:
         if p.side != "over":
-            continue  # procesamos solo over para no duplicar
+            continue
         key = (p.game_slug, p.player, p.tipo, p.line)
         if key in seen_lines:
             continue
         seen_lines.add(key)
-
         slug = p.game_slug or "unknown"
-        grouped_data.setdefault(slug, {})
-        grouped_data[slug].setdefault(p.player, [])
+        grouped_unique.setdefault(slug, {})
+        grouped_unique[slug].setdefault(p.player, [])
+        grouped_unique[slug][p.player].append((p.tipo, p.line, p.source))
 
-        # Calcular PRE scores
-        pid = get_pid_for_name(p.player)
-        if pid:
-            pre_over, meta_over = pre_score(pid, p.tipo, p.line, "over")
-            pre_under, meta_under = pre_score(pid, p.tipo, p.line, "under")
-        else:
-            pre_over, meta_over = 0, {}
-            pre_under, meta_under = 0, {}
+    total_jugadores = sum(len(pls) for pls in grouped_unique.values())
+    total_lineas    = len(seen_lines)
 
-        grouped_data[slug][p.player].append({
-            "tipo": p.tipo,
-            "line": p.line,
-            "pre_over": pre_over,
-            "pre_under": pre_under,
-            "meta_over": meta_over,
-            "source": p.source,
-        })
-
-    # Construir mensajes por partido (un mensaje por partido para no superar límite)
-    total_props = sum(len(pls) for g in grouped_data.values() for pls in g.values())
     await msg_loading.edit_text(
-        f"⚡ Calculando scores para {total_props} props...",
+        f"⚡ *Calculando scores...*\n"
+        f"_{total_jugadores} jugadores · {total_lineas} líneas_\n"
+        f"_(los resultados aparecen partido a partido)_",
         parse_mode=ParseMode.MARKDOWN
     )
 
-    all_messages = []
-
-    for slug in sorted(grouped_data.keys()):
-        matchup = _slug_to_matchup(slug)
-        lines = [f"🟣 *{matchup}*  _{slug}_\n{'─'*30}"]
-
-        players_data = grouped_data[slug]
-        # Ordenar jugadores por su mejor score (over o under) descendente
-        def best_score(pl_entries):
-            scores = [max(e["pre_over"], e["pre_under"]) for e in pl_entries]
-            return max(scores) if scores else 0
-
-        players_sorted = sorted(players_data.keys(), key=lambda pl: best_score(players_data[pl]), reverse=True)
-
-        for pl in players_sorted:
-            entries = sorted(players_data[pl], key=lambda e: tipo_order.get(e["tipo"], 9))
-            lines.append(f"\n👤 *{pl}*")
-
-            for e in entries:
-                tipo = e["tipo"]
-                ln = e["line"]
-                po = e["pre_over"]
-                pu = e["pre_under"]
-                icon = tipo_icon.get(tipo, "•")
-                meta = e.get("meta_over", {})
-
-                # Hits form string
-                h5 = meta.get("hits5", "?")
-                n5 = meta.get("n5", "?")
-                h10 = meta.get("hits10", "?")
-                n10 = meta.get("n10", "?")
-                avg10 = meta.get("avg10", None)
-
-                avg_str = f"prom10: {avg10:.1f}" if avg10 is not None else ""
-
-                lines.append(
-                    f"{icon} *{tipo.upper()}*  línea `{ln}`\n"
-                    f"  OVER  {_pre_rating_emoji(po)} `{po:>3}/100` {_pre_bar(po)} _{_pre_label(po)}_\n"
-                    f"  UNDER {_pre_rating_emoji(pu)} `{pu:>3}/100` {_pre_bar(pu)} _{_pre_label(pu)}_\n"
-                    f"  📊 Forma: `{h5}/{n5}` últimos 5 | `{h10}/{n10}` últimos 10  {avg_str}"
-                )
-
-        all_messages.append("\n".join(lines))
-
-    # Enviar cada partido como mensaje separado
-    await msg_loading.delete()
-
-    # Header global
+    # ── 4. Header global ──
     today_str = date.today().strftime("%d/%m/%Y")
-    fuentes = set(p.source for p in filtered)
+    fuentes   = ", ".join(sorted(set(p.source for p in filtered)))
     header = (
         f"📋 *NBA Props — {today_str}*\n"
-        f"🔌 Fuente: {', '.join(fuentes)}  |  {total_props} líneas\n"
-        f"{'─'*32}\n"
-        f"_Score 1-100: 🔥≥75 ✅≥60 🟡≥45 🟠≥30 ❄️<30_"
+        f"🔌 {fuentes}  ·  {total_lineas} líneas\n"
+        f"{'─'*30}\n"
+        f"_🔥≥75 · ✅≥60 · 🟡≥45 · 🟠≥30 · ❄️<30_"
     )
     await update.message.reply_text(header, parse_mode=ParseMode.MARKDOWN)
 
-    for msg_text in all_messages:
-        if len(msg_text) > 3900:
-            msg_text = msg_text[:3900] + "\n…(recortado)"
+    # ── 5. Procesar y enviar partido a partido ──
+    for slug in sorted(grouped_unique.keys()):
+        matchup = _slug_to_matchup(slug)
+        players_in_game = grouped_unique[slug]
+
+        # Actualizar mensaje de loading con progreso
         try:
-            await update.message.reply_text(msg_text, parse_mode=ParseMode.MARKDOWN)
-        except Exception as e:
-            log.warning(f"Error enviando mensaje odds: {e}")
-            # Intentar sin markdown si falla
-            await update.message.reply_text(msg_text)
+            await msg_loading.edit_text(
+                f"⚡ *Calculando...*\n🏀 _{matchup}_",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception:
+            pass
+
+        # Calcular PRE scores de todos los jugadores del partido en threads
+        # Cada jugador se procesa en paralelo con asyncio.gather
+        async def compute_player(player_name: str, lineas: List[Tuple[str, float, str]]) -> Tuple[str, List[dict]]:
+            results = []
+            for (tipo, line, source) in lineas:
+                entry = await asyncio.to_thread(
+                    _compute_pre_for_player, player_name, tipo, line, source
+                )
+                results.append(entry)
+            return player_name, results
+
+        tasks = [compute_player(pl, lineas) for pl, lineas in players_in_game.items()]
+        player_results_raw = await asyncio.gather(*tasks)
+
+        # Reconstruir dict player → entries
+        players_data: Dict[str, List[dict]] = {}
+        for pl_name, entries in player_results_raw:
+            players_data[pl_name] = sorted(entries, key=lambda e: tipo_order.get(e["tipo"], 9))
+
+        # Construir y enviar mensaje del partido
+        msg_game = _build_game_message(slug, players_data)
+        if len(msg_game) > 3900:
+            # Partir en dos si es muy largo
+            mid = msg_game[:3900].rfind("\n👤")
+            if mid > 0:
+                part1 = msg_game[:mid]
+                part2 = "_(continuación)_\n" + msg_game[mid:]
+                await update.message.reply_text(part1, parse_mode=ParseMode.MARKDOWN)
+                await update.message.reply_text(part2[:3900], parse_mode=ParseMode.MARKDOWN)
+            else:
+                await update.message.reply_text(msg_game[:3900], parse_mode=ParseMode.MARKDOWN)
+        else:
+            try:
+                await update.message.reply_text(msg_game, parse_mode=ParseMode.MARKDOWN)
+            except Exception as e:
+                log.warning(f"Markdown error en {slug}: {e}")
+                await update.message.reply_text(
+                    msg_game.replace("*","").replace("_","").replace("`","")
+                )
+
+    # ── 6. Borrar mensaje de loading al terminar ──
+    try:
+        await msg_loading.delete()
+    except Exception:
+        pass
 
 async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
     props_manual = load_props()
@@ -1523,6 +1587,361 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
     save_alert_state(state)
 
 # =========================
+# INJURY REPORT + LINEUPS
+# =========================
+
+INJURY_CACHE: Dict[str, dict] = {}   # team_id -> {ts, players}
+INJURY_TTL = 15 * 60                 # 15 min
+
+# Posiciones estelares (para evaluar impacto de bajas)
+STAR_ROLES = {"G", "F", "C", "G-F", "F-G", "F-C", "C-F"}
+
+# Status de injury report NBA
+INJURY_STATUS_LABELS = {
+    "Out": "🔴 BAJA",
+    "Doubtful": "🟠 DUDA",
+    "Questionable": "🟡 DUDA POSIBLE",
+    "Probable": "🟢 PROBABLE",
+    "Available": "✅ DISPONIBLE",
+    "Active": "✅ ACTIVO",
+}
+
+def get_team_id_by_tricode(tricode: str) -> Optional[int]:
+    """Obtiene el team_id de NBA por tricode (ej: 'BOS' → 1610612738)."""
+    all_teams = nba_teams_static.get_teams()
+    for t in all_teams:
+        if t.get("abbreviation", "").upper() == tricode.upper():
+            return int(t["id"])
+    return None
+
+def fetch_team_roster_and_injuries(team_id: int) -> dict:
+    """
+    Obtiene el roster completo + injury status via commonteamroster.
+    Retorna dict con 'players': lista de dicts con name, position, status, injury_desc.
+    """
+    cache_key = str(team_id)
+    now = now_ts()
+    if cache_key in INJURY_CACHE and (now - INJURY_CACHE[cache_key].get("ts", 0)) < INJURY_TTL:
+        return INJURY_CACHE[cache_key]
+
+    time.sleep(0.4 + random.random() * 0.2)
+    try:
+        roster = commonteamroster.CommonTeamRoster(
+            team_id=team_id,
+            season=SEASON,
+        )
+        df = roster.get_data_frames()
+        # df[0] = roster, df[1] = coaches
+        roster_df = df[0] if df else None
+        if roster_df is None or roster_df.empty:
+            return {"ts": now, "players": []}
+
+        player_list = []
+        for _, row in roster_df.iterrows():
+            status_raw = str(row.get("HOW_ACQUIRED") or "")
+            # El injury status real viene del live scoreboard, no del roster endpoint
+            # Aquí guardamos la info base del jugador
+            player_list.append({
+                "name": str(row.get("PLAYER") or ""),
+                "position": str(row.get("POSITION") or ""),
+                "number": str(row.get("NUM") or ""),
+                "player_id": int(row.get("PLAYER_ID") or 0),
+                "status": "Active",       # se sobreescribe con live data
+                "injury_desc": "",
+            })
+
+        result = {"ts": now, "players": player_list}
+        INJURY_CACHE[cache_key] = result
+        return result
+
+    except Exception as e:
+        log.warning(f"fetch_team_roster_and_injuries team_id={team_id}: {e}")
+        return {"ts": now, "players": []}
+
+def fetch_injury_report_from_scoreboard(games: list) -> Dict[str, List[dict]]:
+    """
+    Extrae el injury report embebido en el scoreboard de NBA.
+    Retorna dict: team_tricode → lista de {name, status, description, position}
+    """
+    injuries: Dict[str, List[dict]] = {}
+    for g in games:
+        for team_key in ["homeTeam", "awayTeam"]:
+            team = g.get(team_key, {}) or {}
+            tricode = team.get("teamTricode", "")
+            if not tricode:
+                continue
+            injuries.setdefault(tricode, [])
+            # El scoreboard incluye 'players' con gameStatus para live
+            # Pero para injury report pre-game usamos el campo 'injuries' si existe
+            game_injuries = g.get("gameLeaders", {})  # no es la fuente correcta
+
+            # Intentar desde el campo injuries del juego (disponible en algunos endpoints)
+            inj_list = g.get("injuries", []) or []
+            for inj in inj_list:
+                if (inj.get("teamTricode") or "").upper() == tricode.upper():
+                    injuries[tricode].append({
+                        "name": inj.get("playerName", ""),
+                        "status": inj.get("status", ""),
+                        "description": inj.get("injuryDescription", ""),
+                        "position": inj.get("position", ""),
+                    })
+    return injuries
+
+def fetch_boxscore_injury_data(game_id: str) -> Dict[str, List[dict]]:
+    """
+    Obtiene datos de jugadores del boxscore pre-game / live.
+    Incluye status (Active, Inactive, etc.).
+    Retorna dict: team_tricode → lista de jugadores con status
+    """
+    result: Dict[str, List[dict]] = {}
+    try:
+        time.sleep(0.3)
+        box = boxscore.BoxScore(game_id).get_dict().get("game", {})
+        for team_key in ["homeTeam", "awayTeam"]:
+            team = box.get(team_key, {}) or {}
+            tricode = team.get("teamTricode", "")
+            if not tricode:
+                continue
+            result[tricode] = []
+            for pl in team.get("players", []):
+                status = pl.get("status", "Active")
+                name = f"{pl.get('firstName', '')} {pl.get('familyName', '')}".strip()
+                pos = pl.get("position", "")
+                starter = pl.get("starter", "0")
+                not_playing = pl.get("notPlayingReason", "") or pl.get("inactiveReason", "") or ""
+                result[tricode].append({
+                    "name": name,
+                    "status": status,
+                    "position": pos,
+                    "starter": starter == "1",
+                    "not_playing_reason": not_playing,
+                    "player_id": pl.get("personId", 0),
+                })
+    except Exception as e:
+        log.warning(f"fetch_boxscore_injury_data game_id={game_id}: {e}")
+    return result
+
+def _is_star_player(name: str, pid: int) -> bool:
+    """Heurística simple: si tiene historial de 20+ ppg es estrella."""
+    try:
+        _, rows = get_gamelog_table(pid)
+        if not rows or len(rows) < 3:
+            return False
+        pts_vals = []
+        for r in rows[:10]:
+            # PTS suele estar en columna 26 aprox, pero usamos last_n_values
+            pass
+        v = last_n_values(pid, "puntos", 10)
+        avg = sum(v) / len(v) if v else 0
+        return avg >= 18.0
+    except Exception:
+        return False
+
+def analyze_lineup_impact(
+    home_tri: str,
+    away_tri: str,
+    home_players: List[dict],
+    away_players: List[dict],
+) -> List[str]:
+    """
+    Analiza el impacto de ausencias/dudas en el partido.
+    Retorna lista de strings con análisis.
+    """
+    alerts = []
+
+    for tri, pl_list, label in [(home_tri, home_players, "🏠"), (away_tri, away_players, "✈️")]:
+        inactives = [p for p in pl_list if p.get("status", "").lower() in ("inactive", "out")]
+        starters_missing = [p for p in inactives if p.get("starter")]
+
+        out_by_reason: Dict[str, List[str]] = {}
+        for p in inactives:
+            reason = p.get("not_playing_reason") or "Baja"
+            reason_short = reason[:40]
+            out_by_reason.setdefault(reason_short, []).append(p["name"])
+
+        # Estrellas fuera
+        for p in inactives:
+            pid = p.get("player_id", 0)
+            if pid and _is_star_player(p["name"], pid):
+                alerts.append(
+                    f"⚠️ *ESTRELLA BAJA* {label}{tri}: *{p['name']}* ({p.get('not_playing_reason','Out')})\n"
+                    f"   → Impacto ALTO: buscar beneficiados en props"
+                )
+
+        # Muchos titulares fuera
+        if len(starters_missing) >= 2:
+            names = ", ".join(p["name"] for p in starters_missing)
+            alerts.append(
+                f"🚨 *{len(starters_missing)} TITULARES FUERA* {label}{tri}: {names}\n"
+                f"   → Ritmo/rotación afectado, líneas pueden estar desajustadas"
+            )
+        elif len(starters_missing) == 1:
+            alerts.append(
+                f"⚡ *Titular fuera* {label}{tri}: *{starters_missing[0]['name']}*\n"
+                f"   → Posible aumento de minutos para suplentes"
+            )
+
+        # Muchos inactivos en general
+        if len(inactives) >= 4:
+            alerts.append(
+                f"🏥 *{tri}* tiene {len(inactives)} jugadores inactivos hoy — rotación muy corta"
+            )
+
+    # Análisis cruzado: si ambos equipos tienen bajas → más puntos totales (suplentes que corren más)
+    home_inact = sum(1 for p in home_players if p.get("status", "").lower() in ("inactive", "out"))
+    away_inact = sum(1 for p in away_players if p.get("status", "").lower() in ("inactive", "out"))
+    if home_inact >= 2 and away_inact >= 2:
+        alerts.append(
+            f"📈 *Ambos equipos con bajas* ({home_tri}: {home_inact}, {away_tri}: {away_inact})\n"
+            f"   → Partido más abierto, líneas de puntos individuales pueden ser más alcanzables"
+        )
+
+    if not alerts:
+        alerts.append("✅ Sin bajas destacadas — alineaciones completas esperadas")
+
+    return alerts
+
+def format_team_lineup(tricode: str, players_data: List[dict]) -> str:
+    """Formatea la alineación de un equipo de forma visual."""
+    starters = [p for p in players_data if p.get("starter") and p.get("status", "").lower() not in ("inactive", "out")]
+    bench = [p for p in players_data if not p.get("starter") and p.get("status", "").lower() not in ("inactive", "out")]
+    inactives = [p for p in players_data if p.get("status", "").lower() in ("inactive", "out")]
+
+    lines = [f"*{tricode}*"]
+
+    if starters:
+        lines.append("  5️⃣ *Titulares:*")
+        for p in starters[:5]:
+            pos = f"[{p['position']}]" if p.get("position") else ""
+            lines.append(f"    • {p['name']} {pos}")
+
+    if bench:
+        lines.append(f"  🪑 *Banco* ({len(bench)} jug.):")
+        for p in bench[:6]:
+            lines.append(f"    • {p['name']}")
+        if len(bench) > 6:
+            lines.append(f"    ... +{len(bench)-6} más")
+
+    if inactives:
+        lines.append(f"  🔴 *Inactivos* ({len(inactives)}):")
+        for p in inactives:
+            reason = p.get("not_playing_reason", "")
+            reason_str = f" — _{reason[:30]}_" if reason else ""
+            lines.append(f"    • {p['name']}{reason_str}")
+
+    return "\n".join(lines)
+
+async def cmd_lineup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra alineaciones, injury report y análisis de impacto para los partidos de hoy."""
+    msg_wait = await update.message.reply_text(
+        "⏳ Obteniendo alineaciones e injury report...",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    try:
+        board = scoreboard.ScoreBoard().get_dict()["scoreboard"]
+        games = board.get("games", [])
+    except Exception as e:
+        await msg_wait.edit_text(f"⚠️ Error leyendo scoreboard: {e}")
+        return
+
+    if not games:
+        await msg_wait.edit_text("No hay partidos NBA hoy.")
+        return
+
+    # Filtrar por partido si se pasó argumento
+    args = context.args or []
+    filter_tri = " ".join(args).strip().upper() if args else None
+
+    today_str = date.today().strftime("%d/%m/%Y")
+    await msg_wait.edit_text(
+        f"🔄 Cargando datos de {len(games)} partidos...",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    sent_any = False
+    for g in games:
+        away_team = g.get("awayTeam", {}) or {}
+        home_team = g.get("homeTeam", {}) or {}
+        away_tri = away_team.get("teamTricode", "")
+        home_tri = home_team.get("teamTricode", "")
+        game_id = g.get("gameId", "")
+        status_txt = g.get("gameStatusText", "")
+        game_status = g.get("gameStatus", 1)  # 1=pre, 2=live, 3=final
+
+        # Filtro opcional
+        if filter_tri and filter_tri not in (away_tri, home_tri):
+            continue
+
+        # Obtener datos de jugadores desde boxscore
+        box_data = fetch_boxscore_injury_data(game_id) if game_id else {}
+        away_players = box_data.get(away_tri, [])
+        home_players = box_data.get(home_tri, [])
+
+        # Si el boxscore no tiene datos (partido muy early), intentar con roster
+        if not away_players:
+            away_id = get_team_id_by_tricode(away_tri)
+            if away_id:
+                roster_data = fetch_team_roster_and_injuries(away_id)
+                away_players = roster_data.get("players", [])
+
+        if not home_players:
+            home_id = get_team_id_by_tricode(home_tri)
+            if home_id:
+                roster_data = fetch_team_roster_and_injuries(home_id)
+                home_players = roster_data.get("players", [])
+
+        # Análisis de impacto
+        impact_alerts = analyze_lineup_impact(home_tri, away_tri, home_players, away_players)
+
+        # ── Construir mensaje ──
+        game_label = f"✈️ *{away_tri}* @ 🏠 *{home_tri}*"
+        status_icon = "🟢 EN VIVO" if game_status == 2 else ("⏰ PREVIO" if game_status == 1 else "🏁 FINAL")
+
+        header = (
+            f"{'─'*32}\n"
+            f"{game_label}\n"
+            f"{status_icon} | {status_txt}\n"
+            f"{'─'*32}"
+        )
+
+        # Alineaciones
+        away_fmt = format_team_lineup(away_tri, away_players) if away_players else f"*{away_tri}*\n  _(sin datos aún)_"
+        home_fmt = format_team_lineup(home_tri, home_players) if home_players else f"*{home_tri}*\n  _(sin datos aún)_"
+
+        lineup_block = f"🏀 *ALINEACIONES*\n\n{away_fmt}\n\n{home_fmt}"
+
+        # Análisis
+        impact_block = "🧠 *ANÁLISIS DE IMPACTO*\n\n" + "\n\n".join(impact_alerts)
+
+        full_msg = f"{header}\n\n{lineup_block}\n\n{impact_block}"
+
+        if len(full_msg) > 3900:
+            full_msg = full_msg[:3900] + "\n…(recortado)"
+
+        try:
+            await update.message.reply_text(full_msg, parse_mode=ParseMode.MARKDOWN)
+            sent_any = True
+        except Exception as e:
+            log.warning(f"Error enviando lineup msg: {e}")
+            # Intentar sin markdown
+            await update.message.reply_text(
+                full_msg.replace("*", "").replace("_", "").replace("`", "")
+            )
+            sent_any = True
+
+        time.sleep(0.5)  # respetar rate limits
+
+    await msg_wait.delete()
+
+    if not sent_any:
+        await update.message.reply_text(
+            f"No encontré datos para `{filter_tri}`.\n"
+            f"Usa `/lineup` sin argumentos para ver todos los partidos.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+# =========================
 # Main
 # =========================
 async def on_startup(app: Application):
@@ -1552,7 +1971,8 @@ def main():
     app.add_handler(CommandHandler("today", cmd_games))
     app.add_handler(CommandHandler("odds", cmd_odds))
     app.add_handler(CommandHandler("live", cmd_live))
-    app.add_handler(CommandHandler("debug", cmd_debug))   # ← nuevo
+    app.add_handler(CommandHandler("debug", cmd_debug))
+    app.add_handler(CommandHandler("lineup", cmd_lineup))   # ← nuevo
 
     app.post_init = on_startup
     app.run_polling(allowed_updates=Update.ALL_TYPES)
