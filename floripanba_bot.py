@@ -83,7 +83,7 @@ GAMMA = “https://gamma-api.polymarket.com”
 
 # ================================================================
 
-# DÍA 1 — ESQUEMA CANÓNICO DE SEÑAL
+# DÍA 1 - ESQUEMA CANÓNICO DE SEÑAL
 
 # ================================================================
 
@@ -121,7 +121,7 @@ return hashlib.md5(raw.encode()).hexdigest()[:10].upper()
 
 # ================================================================
 
-# DÍA 2 — NORMALIZACIÓN ROBUSTA DE NOMBRES
+# DÍA 2 - NORMALIZACIÓN ROBUSTA DE NOMBRES
 
 # ================================================================
 
@@ -223,7 +223,7 @@ return None
 
 # ================================================================
 
-# DÍA 3 — PERSISTENCIA SQLite
+# DÍA 3 - PERSISTENCIA SQLite
 
 # ================================================================
 
@@ -444,7 +444,7 @@ return True, “”
 
 # ================================================================
 
-# DÍA 4 — MODELO PROBABILÍSTICO PREGAME
+# DÍA 4 - MODELO PROBABILÍSTICO PREGAME
 
 # ================================================================
 
@@ -591,7 +591,7 @@ return Signal(
 
 # ================================================================
 
-# DÍA 5 — FORMATO ESTÁNDAR DE ALERTA + DASHBOARD
+# DÍA 5 - FORMATO ESTÁNDAR DE ALERTA + DASHBOARD
 
 # ================================================================
 
@@ -606,8 +606,8 @@ impl_pct  = round(sig.implied_prob * 100, 1)
 model_pct = round(sig.model_prob   * 100, 1)
 edge_sign = "+" if sig.edge >= 0 else ""
 
-reasons_str = "\n".join(f"  ✅ {r.replace('_',' ')}" for r in sig.reason_codes) or "  —"
-risks_str   = "\n".join(f"  ⚠️ {r.replace('_',' ')}" for r in sig.risk_flags)   or "  —"
+reasons_str = "\n".join(f"  ✅ {r.replace('_',' ')}" for r in sig.reason_codes) or "  -"
+risks_str   = "\n".join(f"  ⚠️ {r.replace('_',' ')}" for r in sig.risk_flags)   or "  -"
 
 matchup = _slug_to_matchup(sig.game_slug)
 
@@ -615,7 +615,7 @@ return (
     f"{level_emoji} | NBA Props\n"
     f"{'─'*30}\n"
     f"👤 *{sig.player.title()}*\n"
-    f"📌 {tipo_icon} {side_str} `{sig.line}` — _{matchup}_\n\n"
+    f"📌 {tipo_icon} {side_str} `{sig.line}` - _{matchup}_\n\n"
     f"📊 Prob implícita: `{impl_pct}%`\n"
     f"🤖 Prob modelo:    `{model_pct}%`\n"
     f"⚡ Edge:           `{edge_sign}{sig.edge}%`\n"
@@ -629,7 +629,7 @@ return (
 
 async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
 “””
-/signals — muestra señales pregame activas del día con edge ≥ umbral.
+/signals - muestra señales pregame activas del día con edge ≥ umbral.
 Calcula en tiempo real y guarda en SQLite.
 “””
 msg_wait = await update.message.reply_text(
@@ -706,7 +706,7 @@ watch_sigs = [s for s in signals if s.level == "watch"]
 
 today_str = date.today().strftime("%d/%m/%Y")
 header = (
-    f"⚡ *SEÑALES PREGAME — {today_str}*\n"
+    f"⚡ *SEÑALES PREGAME - {today_str}*\n"
     f"_{len(entry_sigs)} ENTRY · {len(watch_sigs)} WATCH_\n"
     f"_{len(signals)} señales (edge ≥ {EDGE_THRESH_PREGAME * 0.6:.1f}%)_\n"
     f"{'─'*32}"
@@ -727,7 +727,7 @@ await msg_wait.delete()
 
 async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 “””
-/dashboard — métricas de desempeño: hit rate, edge, ROI por mercado.
+/dashboard - métricas de desempeño: hit rate, edge, ROI por mercado.
 “””
 args = context.args or []
 days = int(args[0]) if args and args[0].isdigit() else 30
@@ -795,7 +795,7 @@ risk = data["risk"]
 risk_bar = f"`{risk['signals_sent']}/{MAX_SIGNALS_DAY}` señales hoy"
 
 msg = (
-    f"📊 *DASHBOARD — últimos {days} días*\n"
+    f"📊 *DASHBOARD - últimos {days} días*\n"
     f"_{today_str}_\n"
     f"{'─'*32}\n\n"
     f"📝 Total señales: `{data['total']}`\n"
@@ -816,7 +816,7 @@ await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 “””
-/status — health check: DB, cache, API, señales activas.
+/status - health check: DB, cache, API, señales activas.
 “””
 def _check():
 checks = {}
@@ -853,7 +853,7 @@ checks[“db”] = f”❌ DB error: {e}”
 
 data = await asyncio.to_thread(_check)
 today_str = date.today().strftime("%d/%m/%Y")
-lines = [f"🔧 *STATUS — {today_str}*\n"]
+lines = [f"🔧 *STATUS - {today_str}*\n"]
 for k, v in data.items():
     lines.append(f"*{k}:* {v}")
 lines.append(f"\n_Bot corriendo · polling cada {POLL_SECONDS}s_")
@@ -1341,7 +1341,7 @@ return False
 
 # =========================
 
-# Polymarket — helpers de matching
+# Polymarket - helpers de matching
 
 # =========================
 
@@ -1783,7 +1783,7 @@ for p in props_all:
 
 # === FALLBACK FINAL: props hardcodeados ===
 if not uniq:
-    log.warning("⚠️  Sin props de Polymarket — usando fallback hardcodeado")
+    log.warning("⚠️  Sin props de Polymarket - usando fallback hardcodeado")
     uniq = list(FALLBACK_PROPS)
 
 PM_CACHE["date"] = today
@@ -1891,7 +1891,7 @@ for existing in props:
 
 props.append(p)
 save_props(props)
-await update.message.reply_text(f"✅ Agregado (manual):\n• {p.player} — {p.tipo.upper()} {p.side.upper()} {p.line}")
+await update.message.reply_text(f"✅ Agregado (manual):\n• {p.player} - {p.tipo.upper()} {p.side.upper()} {p.line}")
 ```
 
 async def cmd_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1926,11 +1926,11 @@ for g in games:
     rec_away = f"{ar}-{al}" if ar is not None and al is not None else ""
     rec_home = f"{hr}-{hl}" if hr is not None and hl is not None else ""
     slug = _slug_from_scoreboard_game(g)
-    lines.append(f"• {at} ({rec_away}) @ {ht} ({rec_home}) — {status}\n  `slug: {slug}`")
+    lines.append(f"• {at} ({rec_away}) @ {ht} ({rec_home}) - {status}\n  `slug: {slug}`")
 
 msg = "\n".join(lines)
 if len(msg) > 3800:
-    msg = msg[:3800] + "\n…(recortado)"
+    msg = msg[:3800] + "\n...(recortado)"
 await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 ```
 
@@ -1990,7 +1990,7 @@ if props:
 
 msg = "\n".join(lines)
 if len(msg) > 3800:
-    msg = msg[:3800] + "\n…"
+    msg = msg[:3800] + "\n..."
 await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 ```
 
@@ -2115,7 +2115,7 @@ for pl in players_sorted:
         avg_str = f"prom10: *{avg10:.1f}*" if avg10 is not None else ""
 
         lines.append(
-            f"{icon} *{tipo.upper()}* — línea `{ln}`\n"
+            f"{icon} *{tipo.upper()}* - línea `{ln}`\n"
             f"  OVER  {_pre_rating_emoji(po)} `{po:>3}/100` {_pre_bar(po)} _{_pre_label(po)}_\n"
             f"  UNDER {_pre_rating_emoji(pu)} `{pu:>3}/100` {_pre_bar(pu)} _{_pre_label(pu)}_\n"
             f"  📊 `{h5}/{n5}` últ.5 | `{h10}/{n10}` últ.10  {avg_str}"
@@ -2202,7 +2202,7 @@ await msg_loading.edit_text(
 today_str = date.today().strftime("%d/%m/%Y")
 fuentes   = ", ".join(sorted(set(p.source for p in filtered)))
 header = (
-    f"📋 *NBA Props — {today_str}*\n"
+    f"📋 *NBA Props - {today_str}*\n"
     f"🔌 {fuentes}  ·  {total_lineas} líneas\n"
     f"{'─'*30}\n"
     f"_🔥≥75 · ✅≥60 · 🟡≥45 · 🟠≥30 · ❄️<30_"
@@ -2255,7 +2255,7 @@ for slug in sorted(grouped_unique.keys()):
     except asyncio.TimeoutError:
         log.warning(f"Timeout global en partido {slug}")
         await update.message.reply_text(
-            f"⚠️ *{matchup}* — timeout calculando scores, mostrando sin PRE.",
+            f"⚠️ *{matchup}* - timeout calculando scores, mostrando sin PRE.",
             parse_mode=ParseMode.MARKDOWN
         )
         continue
@@ -2348,11 +2348,11 @@ if not live_games:
     return
 
 await msg_wait.edit_text(
-    f"🔄 *{len(live_games)} partido(s) en vivo* — leyendo boxscores...",
+    f"🔄 *{len(live_games)} partido(s) en vivo* - leyendo boxscores...",
     parse_mode=ParseMode.MARKDOWN
 )
 
-# ── 2. Props del día (desde cache — no hace requests si ya se cargaron) ──
+# ── 2. Props del día (desde cache - no hace requests si ya se cargaron) ──
 props_manual = load_props()
 props_pm     = PM_CACHE.get("props", [])   # usa cache directamente, SIN request
 if not props_pm:
@@ -2501,7 +2501,7 @@ scored_rows.sort(key=lambda x: x[0], reverse=True)
 top = scored_rows[:15]
 
 tipo_icon = {"puntos": "🏀", "rebotes": "💪", "asistencias": "🎯"}
-out = [f"🔥 *LIVE — {len(live_games)} partido(s)*\n{'─'*28}"]
+out = [f"🔥 *LIVE - {len(live_games)} partido(s)*\n{'─'*28}"]
 
 for (final, live_sc, pre, pr, actual, delta, status, period, clock, mins, pf, diff, meta) in top:
     side_tag = "OVER" if pr.side == "over" else "UNDER"
@@ -2509,7 +2509,7 @@ for (final, live_sc, pre, pr, actual, delta, status, period, clock, mins, pf, di
     icon     = tipo_icon.get(pr.tipo, "•")
     pre_e    = _pre_rating_emoji(final)
     out.append(
-        f"\n{pre_e} `{final}/100` — *{pr.player}*\n"
+        f"\n{pre_e} `{final}/100` - *{pr.player}*\n"
         f"{icon} {pr.tipo.upper()} {side_tag} `{pr.line}` | actual `{actual:.0f}` ({extra})\n"
         f"⏱️ {status} Q{period} {clock} | MIN `{mins:.0f}` PF `{pf:.0f}` Dif `{diff}`\n"
         f"📊 `{meta.get('hits5','?')}/{meta.get('n5','?')}` últ5 "
@@ -2850,7 +2850,7 @@ for tri, pl_list, label in [(home_tri, home_players, "🏠"), (away_tri, away_pl
     # Muchos inactivos en general
     if len(inactives) >= 4:
         alerts.append(
-            f"🏥 *{tri}* tiene {len(inactives)} jugadores inactivos hoy — rotación muy corta"
+            f"🏥 *{tri}* tiene {len(inactives)} jugadores inactivos hoy - rotación muy corta"
         )
 
 # Análisis cruzado: si ambos equipos tienen bajas → más puntos totales (suplentes que corren más)
@@ -2863,7 +2863,7 @@ if home_inact >= 2 and away_inact >= 2:
     )
 
 if not alerts:
-    alerts.append("✅ Sin bajas destacadas — alineaciones completas esperadas")
+    alerts.append("✅ Sin bajas destacadas - alineaciones completas esperadas")
 
 return alerts
 ```
@@ -2894,7 +2894,7 @@ if inactives:
     lines.append(f"  🔴 *Inactivos* ({len(inactives)}):")
     for p in inactives:
         reason = p.get("not_playing_reason", "")
-        reason_str = f" — _{reason[:30]}_" if reason else ""
+        reason_str = f" - _{reason[:30]}_" if reason else ""
         lines.append(f"    • {p['name']}{reason_str}")
 
 return "\n".join(lines)
@@ -2987,7 +2987,7 @@ for g in games:
     full_msg = f"{header}\n\n{lineup_block}\n\n{impact_block}"
 
     if len(full_msg) > 3900:
-        full_msg = full_msg[:3900] + "\n…(recortado)"
+        full_msg = full_msg[:3900] + "\n...(recortado)"
 
     try:
         await update.message.reply_text(full_msg, parse_mode=ParseMode.MARKDOWN)
@@ -3014,7 +3014,7 @@ if not sent_any:
 
 # ================================================================
 
-# BLOQUE 1 — ANÁLISIS ESTADÍSTICO AVANZADO
+# BLOQUE 1 - ANÁLISIS ESTADÍSTICO AVANZADO
 
 # ================================================================
 
@@ -3190,25 +3190,25 @@ if not v10:
 
 lines_out = []
 
-# — Promedios y tendencia —
-avg5  = round(sum(v5)  / len(v5),  1) if v5  else "—"
-avg10 = round(sum(v10) / len(v10), 1) if v10 else "—"
-avg20 = round(sum(v20) / len(v20), 1) if v20 else "—"
+# - Promedios y tendencia -
+avg5  = round(sum(v5)  / len(v5),  1) if v5  else "-"
+avg10 = round(sum(v10) / len(v10), 1) if v10 else "-"
+avg20 = round(sum(v20) / len(v20), 1) if v20 else "-"
 arrow = trend_arrow(v10)
 
 lines_out.append(
     f"📊 *Promedios:* últ.5 `{avg5}` | últ.10 `{avg10}` | últ.20 `{avg20}` {arrow}"
 )
 
-# — Racha actual —
+# - Racha actual -
 racha = streak_info(v10, line, side)
 lines_out.append(f"🔁 *Racha actual:* {racha}  (línea `{line}` {side.upper()})")
 
-# — Últimos 5 juegos detalle —
+# - Últimos 5 juegos detalle -
 vals_str = "  ".join(f"`{v:.0f}`" for v in v5[:5])
 lines_out.append(f"🕐 *Últ. 5 juegos:* {vals_str}")
 
-# — Home/Away splits —
+# - Home/Away splits -
 splits = home_away_splits(pid, tipo)
 if splits:
     loc     = "home" if is_home else "away"
@@ -3222,10 +3222,10 @@ if splits:
         sign    = "+" if diff_ha >= 0 else ""
         lines_out.append(
             f"{loc_icon} *H/A split:* prom {loc_loc_str(is_home)} `{loc_avg}` "
-            f"({loc_n}G)  vs prom opuesto `{opp_avg or '—'}` → dif `{sign}{diff_ha}`"
+            f"({loc_n}G)  vs prom opuesto `{opp_avg or '-'}` → dif `{sign}{diff_ha}`"
         )
 
-# — Matchup histórico vs rival —
+# - Matchup histórico vs rival -
 mu = matchup_stats(pid, opp_tricode, tipo)
 if mu and mu["games"] >= 1:
     lines_out.append(
@@ -3235,11 +3235,11 @@ if mu and mu["games"] >= 1:
 else:
     lines_out.append(f"🆚 *vs {opp_tricode}:* sin historial esta temporada")
 
-# — Back-to-back —
+# - Back-to-back -
 if is_back_to_b2b := is_back_to_back(pid):
     lines_out.append("⚠️ *BACK-TO-BACK:* jugó ayer → posible reducción de minutos/rendimiento")
 
-# — Veredicto automático —
+# - Veredicto automático -
 verdict = _auto_verdict(v10, line, side, avg10 if isinstance(avg10, float) else 0,
                          mu, splits, is_home, is_back_to_b2b)
 lines_out.append(f"\n🧠 *Veredicto:* {verdict}")
@@ -3290,17 +3290,17 @@ if is_b2b:
     warnings.append("back-to-back reduce rendimiento esperado")
 
 if len(signals) >= 2 and len(warnings) == 0:
-    return f"✅ *FAVORABLE* — {'; '.join(signals)}"
+    return f"✅ *FAVORABLE* - {'; '.join(signals)}"
 elif len(signals) >= 1 and len(warnings) == 0:
-    return f"🟡 *LIGERA VENTAJA* — {signals[0]}"
+    return f"🟡 *LIGERA VENTAJA* - {signals[0]}"
 elif len(warnings) >= 2 and len(signals) == 0:
-    return f"🔴 *EN CONTRA* — {'; '.join(warnings)}"
+    return f"🔴 *EN CONTRA* - {'; '.join(warnings)}"
 elif len(warnings) >= 1 and len(signals) == 0:
-    return f"🟠 *PRECAUCIÓN* — {warnings[0]}"
+    return f"🟠 *PRECAUCIÓN* - {warnings[0]}"
 elif signals and warnings:
-    return f"⚖️ *MIXTO* — a favor: {signals[0]} | en contra: {warnings[0]}"
+    return f"⚖️ *MIXTO* - a favor: {signals[0]} | en contra: {warnings[0]}"
 else:
-    return "⚪ Sin señal clara — datos insuficientes"
+    return "⚪ Sin señal clara - datos insuficientes"
 ```
 
 async def cmd_analisis(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3339,7 +3339,7 @@ except Exception:
     return
 
 msg_wait = await update.message.reply_text(
-    f"🔍 Analizando *{player_name}* — {tipo} {side} {line}...",
+    f"🔍 Analizando *{player_name}* - {tipo} {side} {line}...",
     parse_mode=ParseMode.MARKDOWN
 )
 
@@ -3397,13 +3397,13 @@ header = (
 
 full = f"{header}\n\n{analysis_text}"
 if len(full) > 3900:
-    full = full[:3900] + "\n…"
+    full = full[:3900] + "\n..."
 await msg_wait.edit_text(full, parse_mode=ParseMode.MARKDOWN)
 ```
 
 # ================================================================
 
-# BLOQUE 2 — ALERTAS PRE-PARTIDO INTELIGENTES
+# BLOQUE 2 - ALERTAS PRE-PARTIDO INTELIGENTES
 
 # ================================================================
 
@@ -3445,7 +3445,7 @@ msg = (
     f"👤 *{player}*\n"
     f"{tipo_icon} {tipo.upper()} *{side.upper()}* `{line}`\n\n"
     f"{pre_emoji} PRE Score: *{pre}/100* {pre_bar}\n"
-    f"_{pre_lbl}_ — `{h5}/{n5}` últ.5 | `{h10}/{n10}` últ.10"
+    f"_{pre_lbl}_ - `{h5}/{n5}` últ.5 | `{h10}/{n10}` últ.10"
     + (f" | prom `{avg:.1f}`" if avg else "") + "\n"
 )
 if flags_str:
@@ -3517,7 +3517,7 @@ for p in pregame_props:
             flags.append("Tendencia ALCISTA en últimos 5 🔺")
         # Back-to-back
         if is_back_to_back(pid):
-            flags.append("⚠️ Back-to-back — puede afectar minutos")
+            flags.append("⚠️ Back-to-back - puede afectar minutos")
         return flags
 
     extra_flags = await asyncio.to_thread(_extra)
@@ -3538,7 +3538,7 @@ save_smart_alerts_state(state)
 
 async def cmd_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
 “””
-/alertas — muestra todas las props pre-partido con PRE ≥ 60, ordenadas.
+/alertas - muestra todas las props pre-partido con PRE ≥ 60, ordenadas.
 “””
 msg_wait = await update.message.reply_text(
 “🔍 *Buscando mejores props pre-partido…*”,
@@ -3589,7 +3589,7 @@ if not scored:
 
 today_str = date.today().strftime("%d/%m/%Y")
 lines = [
-    f"🏆 *MEJORES PROPS HOY — {today_str}*",
+    f"🏆 *MEJORES PROPS HOY - {today_str}*",
     f"_{len(scored)} props con PRE ≥ 55, ordenadas por score_\n",
 ]
 
@@ -3605,20 +3605,20 @@ for i, (pre, prop, meta) in enumerate(scored[:20], 1):
     avg_str  = f"prom `{avg10:.1f}`" if avg10 else ""
 
     lines.append(
-        f"*{i}.* {pre_e} `{pre}/100` — *{prop.player}*\n"
+        f"*{i}.* {pre_e} `{pre}/100` - *{prop.player}*\n"
         f"   {icon} {prop.tipo.upper()} OVER `{prop.line}`  _{matchup}_\n"
         f"   {bar}  {avg_str}  `{h5}/{n5}` últ5 | `{h10}/{n10}` últ10"
     )
 
 msg = "\n".join(lines)
 if len(msg) > 3900:
-    msg = msg[:3900] + "\n…(recortado)"
+    msg = msg[:3900] + "\n...(recortado)"
 await msg_wait.edit_text(msg, parse_mode=ParseMode.MARKDOWN)
 ```
 
 # ================================================================
 
-# BLOQUE 3 — HISTORIAL Y TRACKING DE APUESTAS
+# BLOQUE 3 - HISTORIAL Y TRACKING DE APUESTAS
 
 # ================================================================
 
@@ -3795,15 +3795,15 @@ emoji = {"win": "✅", "loss": "❌", "push": "🔁"}.get(result.lower(), "❓")
 actual_str = f" | stat real: `{actual}`" if actual else ""
 await update.message.reply_text(
     f"{emoji} Apuesta `#{bet_id}` → *{result}*{actual_str}\n"
-    f"👤 {found.player} — {found.tipo.upper()} {found.side.upper()} `{found.line}`",
+    f"👤 {found.player} - {found.tipo.upper()} {found.side.upper()} `{found.line}`",
     parse_mode=ParseMode.MARKDOWN
 )
 ```
 
 async def cmd_historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
 “””
-/historial — muestra estadísticas completas de tus apuestas.
-/historial 30 — últimos 30 días (default: 30)
+/historial - muestra estadísticas completas de tus apuestas.
+/historial 30 - últimos 30 días (default: 30)
 “””
 args = context.args or []
 days = int(args[0]) if args and args[0].isdigit() else 30
@@ -3838,13 +3838,13 @@ roi        = round(net_units / sum(b.amount for b in resolved) * 100, 1) if reso
 def type_stats(bets_list, tipo):
     sub = [b for b in bets_list if b.tipo == tipo and b.result in ("win","loss")]
     w   = sum(1 for b in sub if b.result == "win")
-    return f"`{w}/{len(sub)}`" if sub else "—"
+    return f"`{w}/{len(sub)}`" if sub else "-"
 
 # Stats por side
 def side_stats(bets_list, side):
     sub = [b for b in bets_list if b.side == side and b.result in ("win","loss")]
     w   = sum(1 for b in sub if b.result == "win")
-    return f"`{w}/{len(sub)}`" if sub else "—"
+    return f"`{w}/{len(sub)}`" if sub else "-"
 
 # Mejor y peor racha
 def calc_streaks(bets_sorted):
@@ -3876,7 +3876,7 @@ roi_sign = "+" if roi >= 0 else ""
 roi_emoji = "🟢" if roi > 0 else ("🔴" if roi < 0 else "⚪")
 
 msg = (
-    f"📊 *MI HISTORIAL — últimos {days} días*\n"
+    f"📊 *MI HISTORIAL - últimos {days} días*\n"
     f"{'─'*30}\n"
     f"📝 Total apuestas: `{len(mine)}`  "
     f"(resueltas: `{len(resolved)}` | pendientes: `{len(pending)}`)\n\n"
@@ -3903,20 +3903,20 @@ if top_players:
 if pending:
     msg += f"\n*⏳ Pendientes ({len(pending)}):*\n"
     for b in pending[-5:]:
-        msg += f"  `#{b.id}` {b.player} {b.tipo.upper()} {b.side.upper()} `{b.line}` — `{b.amount}`u\n"
+        msg += f"  `#{b.id}` {b.player} {b.tipo.upper()} {b.side.upper()} `{b.line}` - `{b.amount}`u\n"
     if len(pending) > 5:
         msg += f"  _...y {len(pending)-5} más_\n"
 
 msg += f"\n_Usa `/resultado ID WIN|LOSS stat` para resolver_"
 
 if len(msg) > 3900:
-    msg = msg[:3900] + "\n…"
+    msg = msg[:3900] + "\n..."
 await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 ```
 
 async def cmd_misapuestas(update: Update, context: ContextTypes.DEFAULT_TYPE):
 “””
-/misapuestas — lista las apuestas pendientes del usuario.
+/misapuestas - lista las apuestas pendientes del usuario.
 “””
 user_id = update.effective_user.id if update.effective_user else 0
 bets    = load_bets()
@@ -3935,23 +3935,23 @@ lines = [f"⏳ *Apuestas pendientes* ({len(pending)})\n"]
 for b in sorted(pending, key=lambda x: x.placed_at, reverse=True):
     icon     = tipo_icon.get(b.tipo, "•")
     pre_e    = _pre_rating_emoji(b.pre_score)
-    matchup  = _slug_to_matchup(b.game_slug) if b.game_slug else "—"
+    matchup  = _slug_to_matchup(b.game_slug) if b.game_slug else "-"
     ts_str   = time.strftime("%d/%m %H:%M", time.localtime(b.placed_at))
     lines.append(
         f"`#{b.id}` {icon} *{b.player}*\n"
-        f"  {b.tipo.upper()} {b.side.upper()} `{b.line}` — `{b.amount}`u\n"
+        f"  {b.tipo.upper()} {b.side.upper()} `{b.line}` - `{b.amount}`u\n"
         f"  {pre_e} PRE `{b.pre_score}/100` | {matchup} | {ts_str}"
     )
 
 msg = "\n\n".join(lines)
 if len(msg) > 3900:
-    msg = msg[:3900] + "\n…"
+    msg = msg[:3900] + "\n..."
 await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 ```
 
 # ================================================================
 
-# BLOQUE A — CONTEXTO DEFENSIVO + PACE
+# BLOQUE A - CONTEXTO DEFENSIVO + PACE
 
 # ================================================================
 
@@ -4172,7 +4172,7 @@ return "\n".join(lines)
 
 # ================================================================
 
-# BLOQUE B — MODELO MEJORADO (PRE v2 con contexto)
+# BLOQUE B - MODELO MEJORADO (PRE v2 con contexto)
 
 # ================================================================
 
@@ -4362,7 +4362,7 @@ for pl in sorted(players_data.keys(), key=lambda p: best_score(players_data[p]),
         ctx_line = f"  🛡️ `{' · '.join(ctx_parts)}`\n" if ctx_parts else ""
 
         lines.append(
-            f"{icon} *{tipo.upper()}* — `{ln}`\n"
+            f"{icon} *{tipo.upper()}* - `{ln}`\n"
             f"  OVER  {_pre_rating_emoji(po)} `{po:>3}/100` {_pre_bar(po)} _{_pre_label(po)}_\n"
             f"  UNDER {_pre_rating_emoji(pu)} `{pu:>3}/100` {_pre_bar(pu)} _{_pre_label(pu)}_\n"
             f"{adj_str}"
@@ -4375,7 +4375,7 @@ return "\n".join(lines)
 
 # ================================================================
 
-# BLOQUE C — RESUMEN MATUTINO AUTOMÁTICO
+# BLOQUE C - RESUMEN MATUTINO AUTOMÁTICO
 
 # ================================================================
 
@@ -4434,7 +4434,7 @@ for g in games:
     aw   = away.get("wins",0); al = away.get("losses",0)
     hw   = home.get("wins",0); hl = home.get("losses",0)
     st   = g.get("gameStatusText","")
-    game_lines.append(f"  • *{at}* ({aw}-{al}) @ *{ht}* ({hw}-{hl}) — _{st}_")
+    game_lines.append(f"  • *{at}* ({aw}-{al}) @ *{ht}* ({hw}-{hl}) - _{st}_")
 
 # ── Injury report rápido (solo bajas confirmadas) ──
 injury_lines = ["\n🏥 *INJURY REPORT:*"]
@@ -4505,7 +4505,7 @@ try:
         icon     = tipo_icon.get(prop.tipo,"•")
         props_lines.append(
             f"  *{i}.* {_pre_rating_emoji(score)} `{score}/100` "
-            f"— *{prop.player}*\n"
+            f"- *{prop.player}*\n"
             f"     {icon} {prop.tipo.upper()} OVER `{prop.line}` _{matchup}_\n"
             f"     {avg_str}{adj_str}"
         )
@@ -4520,7 +4520,7 @@ footer = (
 
 full_msg = header + "\n".join(game_lines) + "\n".join(injury_lines) + "\n".join(props_lines) + footer
 if len(full_msg) > 3900:
-    full_msg = full_msg[:3900] + "\n…"
+    full_msg = full_msg[:3900] + "\n..."
 
 try:
     await context.bot.send_message(chat_id=chat_id, text=full_msg, parse_mode=ParseMode.MARKDOWN)
@@ -4541,7 +4541,7 @@ await send_morning_digest(context)
 
 # ================================================================
 
-# BLOQUE D — AUTO-RESOLUCIÓN DE APUESTAS
+# BLOQUE D - AUTO-RESOLUCIÓN DE APUESTAS
 
 # ================================================================
 
@@ -4639,13 +4639,13 @@ if resolved_any:
 
 # ================================================================
 
-# COMANDO /contexto — ver contexto defensivo de un partido
+# COMANDO /contexto - ver contexto defensivo de un partido
 
 # ================================================================
 
 async def cmd_contexto(update: Update, context: ContextTypes.DEFAULT_TYPE):
 “””
-/contexto BOS DEN — contexto defensivo, pace y stats permitidas
+/contexto BOS DEN - contexto defensivo, pace y stats permitidas
 de ambos equipos para el partido de hoy.
 “””
 args = context.args or []
@@ -4683,13 +4683,13 @@ def _fetch():
 away_ctx, home_ctx = await asyncio.to_thread(_fetch)
 
 def _fmt_team(tri: str, ctx_dict: dict, label: str) -> str:
-    lines = [f"*{label} — {tri} (defensivamente)*"]
+    lines = [f"*{label} - {tri} (defensivamente)*"]
     for tipo, key in [("Puntos","ctx_pts"),("Rebotes","ctx_reb"),("Asistencias","ctx_ast")]:
         ctx = ctx_dict[key]
         dr  = ctx.get("def_rating"); dr_r = ctx.get("def_rank","?")
         pr  = ctx.get("pace");       pr_r = ctx.get("pace_rank","?")
         os  = ctx.get("opp_stat");   osr  = ctx.get("opp_stat_rank","?")
-        os_str = f"`{os:.1f}` (rank #{osr})" if os else "—"
+        os_str = f"`{os:.1f}` (rank #{osr})" if os else "-"
         lines.append(
             f"  🏷️ *{tipo}* permitidos: {os_str}\n"
             f"     Def Rating `{dr:.1f}` #{dr_r} · Pace `{pr:.1f}` #{pr_r}\n"
@@ -4707,7 +4707,7 @@ full = (
 )
 
 if len(full) > 3900:
-    full = full[:3900] + "\n…"
+    full = full[:3900] + "\n..."
 await msg_wait.edit_text(full, parse_mode=ParseMode.MARKDOWN)
 ```
 
@@ -4883,12 +4883,12 @@ users = load_users()
 lines = ["👥 *Usuarios autorizados:*\n"]
 
 for u_id in users.get("allowed", []):
-    nick   = users["nicknames"].get(str(u_id), "—")
+    nick   = users["nicknames"].get(str(u_id), "-")
     is_adm = "👑 " if u_id in users.get("admins", []) else "• "
-    lines.append(f"{is_adm}`{u_id}` — {nick}")
+    lines.append(f"{is_adm}`{u_id}` - {nick}")
 
 if ADMIN_ID and ADMIN_ID not in users.get("allowed", []):
-    lines.append(f"👑 `{ADMIN_ID}` — Admin (env)")
+    lines.append(f"👑 `{ADMIN_ID}` - Admin (env)")
 
 if len(lines) == 1:
     lines.append("_Sin usuarios registrados aún_")
@@ -4901,8 +4901,8 @@ async def cmd_miperfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
 “”“Muestra el ID y perfil del usuario actual.”””
 if not await guard(update): return
 uid   = update.effective_user.id if update.effective_user else 0
-uname = update.effective_user.username or “—”
-fname = update.effective_user.first_name or “—”
+uname = update.effective_user.username or “-”
+fname = update.effective_user.first_name or “-”
 nick  = user_display(uid)
 adm   = “👑 Admin” if is_admin(uid) else “👤 Usuario”
 
@@ -4994,7 +4994,7 @@ if ADMIN_ID and uid == ADMIN_ID:
 elif not users["allowed"] and not users["admins"]:
     add_user(uid, uname, admin=True)
     await update.message.reply_text(
-        f"👑 *Primer usuario — eres Admin automáticamente*\n"
+        f"👑 *Primer usuario - eres Admin automáticamente*\n"
         f"Tu ID: `{uid}`\n"
         f"Para invitar amigos: `/adduser ID Nombre`",
         parse_mode=ParseMode.MARKDOWN
