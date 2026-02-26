@@ -9,7 +9,6 @@ import logging
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
 from datetime import date
-from collections import defaultdict
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -38,6 +37,7 @@ if not TELEGRAM_TOKEN:
     raise RuntimeError("Missing TELEGRAM_TOKEN env var")
 
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "120"))
+
 PROPS_FILE = "props.json"
 ALERTS_STATE_FILE = "alerts_state.json"
 IDS_CACHE_FILE = "player_ids_cache.json"
@@ -86,6 +86,15 @@ NBA_HEADERS = {
     "x-nba-stats-token": "true",
 }
 
+PM_HEADERS = {
+    "User-Agent": NBA_HEADERS["User-Agent"],
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+    "Origin": "https://polymarket.com",
+    "Referer": "https://polymarket.com/",
+    "Connection": "keep-alive",
+}
+
 def build_session(headers: dict) -> requests.Session:
     s = requests.Session()
     retry = Retry(
@@ -104,8 +113,7 @@ def build_session(headers: dict) -> requests.Session:
     return s
 
 SESSION_NBA = build_session(NBA_HEADERS)
-SESSION_PM = build_session({"User-Agent": NBA_HEADERS["User-Agent"], "Accept": "application/json"})
-
+SESSION_PM = build_session(PM_HEADERS)
 
 # =========================
 # Persistence helpers
@@ -126,17 +134,16 @@ def save_json(path: str, data):
 def now_ts() -> int:
     return int(time.time())
 
-
 # =========================
 # Data model
 # =========================
 @dataclass
 class Prop:
-    player: str              # "Stephen Curry"
+    player: str
     tipo: str                # "puntos" | "rebotes" | "asistencias"
-    line: float              # 26.5
+    line: float
     side: str                # "over" | "under"
-    source: str = "manual"   # manual | polymarket
+    source: str = "manual"   # manual | polymarket | fallback
     game_slug: Optional[str] = None
     market_id: Optional[str] = None
     added_by: Optional[int] = None
@@ -155,7 +162,6 @@ def load_props() -> List[Prop]:
 def save_props(props: List[Prop]):
     save_json(PROPS_FILE, {"props": [asdict(p) for p in props]})
 
-
 # =========================
 # Player ID cache
 # =========================
@@ -169,7 +175,7 @@ def obtener_id_jugador(nombre: str) -> Optional[int]:
     return int(pick.get("id"))
 
 def load_ids_cache() -> Dict[str, int]:
-    return load_json(IDS_CACHE_FILE, {})  # name -> id
+    return load_json(IDS_CACHE_FILE, {})
 
 def save_ids_cache(c: Dict[str, int]):
     save_json(IDS_CACHE_FILE, c)
@@ -183,7 +189,6 @@ def get_pid_for_name(name: str) -> Optional[int]:
         cache[name] = int(pid)
         save_ids_cache(cache)
     return pid
-
 
 # =========================
 # Gamelog cache + fetch (stats.nba.com)
@@ -240,9 +245,8 @@ def get_gamelog_table(pid: int) -> Tuple[List[str], List[list]]:
     except Exception:
         return cache.get(k, {}).get("headers", []), cache.get(k, {}).get("rows", [])
 
-
 # =========================
-# PRE SCORE (forma 5/10) for over/under
+# PRE SCORE
 # =========================
 def clamp(x, lo=0, hi=100):
     return max(lo, min(hi, x))
@@ -326,9 +330,8 @@ def pre_score(pid: int, tipo: str, line: float, side: str) -> Tuple[int, dict]:
     }
     return PRE, meta
 
-
 # =========================
-# Live helpers (nba_api live)
+# Live helpers
 # =========================
 def parse_minutes(min_str) -> float:
     if not min_str:
@@ -368,7 +371,6 @@ def game_elapsed_minutes(period: int, clock_seconds: Optional[int]) -> Optional[
     total_before = 4 * 720 + (period - 5) * 300
     elapsed_in_period = 300 - min(clock_seconds, 300)
     return (total_before + elapsed_in_period) / 60.0
-
 
 # =========================
 # LIVE SCORE
@@ -468,7 +470,6 @@ def compute_under_score(tipo, margin_under, mins, pf, period, clock_seconds, dif
     score = cushion + time_score + blow + min_bonus - (clutch_pen if is_clutch else 0) - foul_pen
     return int(clamp(score, 0, 100))
 
-
 # =========================
 # Alert state / cooldown
 # =========================
@@ -486,21 +487,18 @@ def can_send_alert(state: dict, key: str) -> bool:
         return True
     return False
 
-
 # =========================
 # Polymarket: parse props P/R/A desde event slug
 # =========================
 PM_CACHE = {"ts": 0, "date": None, "props": []}
-PM_TTL_SECONDS = 8 * 60  # cache 8 min
+PM_TTL_SECONDS = 8 * 60
 
 _TIPO_MAP = {"points": "puntos", "rebounds": "rebotes", "assists": "asistencias"}
 
-# Ej:
-# "Isaiah Hartenstein: Assists O/U 3.5"
-# "Cade Cunningham: Points O/U 25.5"
+# Ej: "Isaiah Hartenstein: Assists O/U 3.5"
 _PM_Q_RE = re.compile(
     r"^(?P<player>.+?):\s*(?P<stat>Points|Rebounds|Assists)\s*O\/U\s*(?P<line>\d+(?:\.\d+)?)",
-    re.IGNORECASE
+    re.IGNORECASE,
 )
 
 def _slug_from_scoreboard_game(g: dict) -> str:
@@ -544,20 +542,103 @@ def polymarket_props_from_event(event_json: dict) -> List[Prop]:
             continue
 
         line_val = float(line if line is not None else parsed_line)
-
         market_id = str(m.get("id") or "")
         tipo = _TIPO_MAP.get(smt)
         if not tipo or not player:
             continue
 
-        out.append(Prop(player=player, tipo=tipo, side="over", line=line_val, source="polymarket", game_slug=event_slug, market_id=market_id))
-        out.append(Prop(player=player, tipo=tipo, side="under", line=line_val, source="polymarket", game_slug=event_slug, market_id=market_id))
-
+        out.append(Prop(player=player, tipo=tipo, side="over", line=line_val, source="polymarket",
+                        game_slug=event_slug, market_id=market_id))
+        out.append(Prop(player=player, tipo=tipo, side="under", line=line_val, source="polymarket",
+                        game_slug=event_slug, market_id=market_id))
     return out
+
+# ---- FALLBACK MANUAL (si Gamma falla) ----
+_FALLBACK_DATE = "2026-02-25"
+FALLBACK_PROPS: List[Prop] = [
+    # BOS @ DEN
+    Prop("Jaylen Brown", "puntos", 28.5, "over", source="fallback", game_slug="nba-bos-den-2026-02-25"),
+    Prop("Jaylen Brown", "puntos", 28.5, "under", source="fallback", game_slug="nba-bos-den-2026-02-25"),
+    Prop("Nikola Jokić", "puntos", 27.5, "over", source="fallback", game_slug="nba-bos-den-2026-02-25"),
+    Prop("Nikola Jokić", "puntos", 27.5, "under", source="fallback", game_slug="nba-bos-den-2026-02-25"),
+    Prop("Jamal Murray", "puntos", 23.5, "over", source="fallback", game_slug="nba-bos-den-2026-02-25"),
+    Prop("Jamal Murray", "puntos", 23.5, "under", source="fallback", game_slug="nba-bos-den-2026-02-25"),
+    Prop("Payton Pritchard", "puntos", 18.5, "over", source="fallback", game_slug="nba-bos-den-2026-02-25"),
+    Prop("Payton Pritchard", "puntos", 18.5, "under", source="fallback", game_slug="nba-bos-den-2026-02-25"),
+    Prop("Derrick White", "puntos", 17.5, "over", source="fallback", game_slug="nba-bos-den-2026-02-25"),
+    Prop("Derrick White", "puntos", 17.5, "under", source="fallback", game_slug="nba-bos-den-2026-02-25"),
+
+    # CLE @ MIL
+    Prop("Donovan Mitchell", "puntos", 26.5, "over", source="fallback", game_slug="nba-cle-mil-2026-02-25"),
+    Prop("Donovan Mitchell", "puntos", 26.5, "under", source="fallback", game_slug="nba-cle-mil-2026-02-25"),
+    Prop("James Harden", "puntos", 20.5, "over", source="fallback", game_slug="nba-cle-mil-2026-02-25"),
+    Prop("James Harden", "puntos", 20.5, "under", source="fallback", game_slug="nba-cle-mil-2026-02-25"),
+    Prop("Jarrett Allen", "puntos", 15.5, "over", source="fallback", game_slug="nba-cle-mil-2026-02-25"),
+    Prop("Jarrett Allen", "puntos", 15.5, "under", source="fallback", game_slug="nba-cle-mil-2026-02-25"),
+    Prop("Sam Merrill", "puntos", 11.5, "over", source="fallback", game_slug="nba-cle-mil-2026-02-25"),
+    Prop("Sam Merrill", "puntos", 11.5, "under", source="fallback", game_slug="nba-cle-mil-2026-02-25"),
+    Prop("Jaylon Tyson", "puntos", 11.5, "over", source="fallback", game_slug="nba-cle-mil-2026-02-25"),
+    Prop("Jaylon Tyson", "puntos", 11.5, "under", source="fallback", game_slug="nba-cle-mil-2026-02-25"),
+
+    # GSW @ MEM
+    Prop("Al Horford", "rebotes", 6.5, "over", source="fallback", game_slug="nba-gsw-mem-2026-02-25"),
+    Prop("Al Horford", "rebotes", 6.5, "under", source="fallback", game_slug="nba-gsw-mem-2026-02-25"),
+    Prop("Moses Moody", "puntos", 18.5, "over", source="fallback", game_slug="nba-gsw-mem-2026-02-25"),
+    Prop("Moses Moody", "puntos", 18.5, "under", source="fallback", game_slug="nba-gsw-mem-2026-02-25"),
+    Prop("Brandin Podziemski", "puntos", 17.5, "over", source="fallback", game_slug="nba-gsw-mem-2026-02-25"),
+    Prop("Brandin Podziemski", "puntos", 17.5, "under", source="fallback", game_slug="nba-gsw-mem-2026-02-25"),
+    Prop("Ty Jerome", "puntos", 16.5, "over", source="fallback", game_slug="nba-gsw-mem-2026-02-25"),
+    Prop("Ty Jerome", "puntos", 16.5, "under", source="fallback", game_slug="nba-gsw-mem-2026-02-25"),
+    Prop("GG Jackson II", "puntos", 14.5, "over", source="fallback", game_slug="nba-gsw-mem-2026-02-25"),
+    Prop("GG Jackson II", "puntos", 14.5, "under", source="fallback", game_slug="nba-gsw-mem-2026-02-25"),
+
+    # OKC @ DET
+    Prop("Isaiah Hartenstein", "asistencias", 3.5, "over", source="fallback", game_slug="nba-okc-det-2026-02-25"),
+    Prop("Isaiah Hartenstein", "asistencias", 3.5, "under", source="fallback", game_slug="nba-okc-det-2026-02-25"),
+    Prop("Daniss Jenkins", "asistencias", 2.5, "over", source="fallback", game_slug="nba-okc-det-2026-02-25"),
+    Prop("Daniss Jenkins", "asistencias", 2.5, "under", source="fallback", game_slug="nba-okc-det-2026-02-25"),
+    Prop("Chet Holmgren", "puntos", 17.5, "over", source="fallback", game_slug="nba-okc-det-2026-02-25"),
+    Prop("Chet Holmgren", "puntos", 17.5, "under", source="fallback", game_slug="nba-okc-det-2026-02-25"),
+    Prop("Isaiah Joe", "puntos", 14.5, "over", source="fallback", game_slug="nba-okc-det-2026-02-25"),
+    Prop("Isaiah Joe", "puntos", 14.5, "under", source="fallback", game_slug="nba-okc-det-2026-02-25"),
+    Prop("Cason Wallace", "puntos", 11.5, "over", source="fallback", game_slug="nba-okc-det-2026-02-25"),
+    Prop("Cason Wallace", "puntos", 11.5, "under", source="fallback", game_slug="nba-okc-det-2026-02-25"),
+
+    # SAC @ HOU
+    Prop("Tari Eason", "rebotes", 7.5, "over", source="fallback", game_slug="nba-sac-hou-2026-02-25"),
+    Prop("Tari Eason", "rebotes", 7.5, "under", source="fallback", game_slug="nba-sac-hou-2026-02-25"),
+    Prop("Precious Achiuwa", "rebotes", 6.5, "over", source="fallback", game_slug="nba-sac-hou-2026-02-25"),
+    Prop("Precious Achiuwa", "rebotes", 6.5, "under", source="fallback", game_slug="nba-sac-hou-2026-02-25"),
+    Prop("Kevin Durant", "rebotes", 5.5, "over", source="fallback", game_slug="nba-sac-hou-2026-02-25"),
+    Prop("Kevin Durant", "rebotes", 5.5, "under", source="fallback", game_slug="nba-sac-hou-2026-02-25"),
+    Prop("Keegan Murray", "rebotes", 5.5, "over", source="fallback", game_slug="nba-sac-hou-2026-02-25"),
+    Prop("Keegan Murray", "rebotes", 5.5, "under", source="fallback", game_slug="nba-sac-hou-2026-02-25"),
+    Prop("Dorian Finney-Smith", "rebotes", 3.5, "over", source="fallback", game_slug="nba-sac-hou-2026-02-25"),
+    Prop("Dorian Finney-Smith", "rebotes", 3.5, "under", source="fallback", game_slug="nba-sac-hou-2026-02-25"),
+
+    # SAS @ TOR
+    Prop("Scottie Barnes", "asistencias", 4.5, "over", source="fallback", game_slug="nba-sas-tor-2026-02-25"),
+    Prop("Scottie Barnes", "asistencias", 4.5, "under", source="fallback", game_slug="nba-sas-tor-2026-02-25"),
+    Prop("Brandon Ingram", "puntos", 21.5, "over", source="fallback", game_slug="nba-sas-tor-2026-02-25"),
+    Prop("Brandon Ingram", "puntos", 21.5, "under", source="fallback", game_slug="nba-sas-tor-2026-02-25"),
+    Prop("RJ Barrett", "puntos", 17.5, "over", source="fallback", game_slug="nba-sas-tor-2026-02-25"),
+    Prop("RJ Barrett", "puntos", 17.5, "under", source="fallback", game_slug="nba-sas-tor-2026-02-25"),
+    Prop("Scottie Barnes", "puntos", 17.5, "over", source="fallback", game_slug="nba-sas-tor-2026-02-25"),
+    Prop("Scottie Barnes", "puntos", 17.5, "under", source="fallback", game_slug="nba-sas-tor-2026-02-25"),
+    Prop("Scottie Barnes", "rebotes", 8.5, "over", source="fallback", game_slug="nba-sas-tor-2026-02-25"),
+    Prop("Scottie Barnes", "rebotes", 8.5, "under", source="fallback", game_slug="nba-sas-tor-2026-02-25"),
+]
+
+def fallback_props_if_needed() -> List[Prop]:
+    # Solo para el día que nos pasaste (evita contaminar otros días).
+    if date.today().isoformat() == _FALLBACK_DATE:
+        return FALLBACK_PROPS
+    return []
 
 def polymarket_props_today_from_scoreboard() -> List[Prop]:
     today = date.today().isoformat()
     now = now_ts()
+
     if PM_CACHE["date"] == today and (now - PM_CACHE["ts"]) < PM_TTL_SECONDS:
         return PM_CACHE["props"]
 
@@ -584,49 +665,14 @@ def polymarket_props_today_from_scoreboard() -> List[Prop]:
         seen.add(k)
         uniq.append(p)
 
+    # fallback si Gamma devolvió 0
+    if not uniq:
+        uniq = fallback_props_if_needed()
+
     PM_CACHE["date"] = today
     PM_CACHE["ts"] = now
     PM_CACHE["props"] = uniq
     return uniq
-
-
-# =========================
-# Pretty formatting for /odds
-# =========================
-def _fmt_tipo(tipo: str) -> str:
-    t = (tipo or "").lower().strip()
-    if t == "puntos":
-        return "Puntos"
-    if t == "rebotes":
-        return "Rebotes"
-    if t == "asistencias":
-        return "Asistencias"
-    return tipo
-
-def _fmt_line(x: float) -> str:
-    try:
-        xf = float(x)
-        return str(int(xf)) if xf.is_integer() else str(xf)
-    except Exception:
-        return str(x)
-
-def _odds_filter_from_text(text: str) -> str:
-    # /odds algo...
-    t = (text or "").strip()
-    t = re.sub(r"^/odds(@\w+)?\s*", "", t).strip()
-    return t
-
-def _match_filter(prop: Prop, flt: str) -> bool:
-    if not flt:
-        return True
-    f = flt.lower().strip()
-    # si parece slug o parte de slug
-    if "nba-" in f or "-" in f:
-        gs = (prop.game_slug or "").lower()
-        return f in gs
-    # si no, se asume filtro por jugador
-    return f in (prop.player or "").lower()
-
 
 # =========================
 # Commands
@@ -634,13 +680,12 @@ def _match_filter(prop: Prop, flt: str) -> bool:
 HELP_TEXT = (
     "🧠 *NBA Interactive Bot*\n\n"
     "Comandos:\n"
-    "• `/games` o `/today` → programación NBA de hoy\n"
-    "• `/odds` → props P/R/A de Polymarket (auto)\n"
-    "   Filtros:\n"
-    "   - `/odds okc-det` (match parcial)\n"
-    "   - `/odds nba-okc-det-2026-02-25` (slug exacto)\n"
-    "   - `/odds jokic` (por jugador)\n"
-    "• `/live` → top props en vivo (auto) + scoring\n\n"
+    "• `/games`  → programación NBA de hoy\n"
+    "• `/today`  → alias de /games\n"
+    "• `/odds`   → props P/R/A de Polymarket (auto)\n"
+    "   - `/odds nba-okc-det-2026-02-25`  (solo ese partido)\n"
+    "   - `/odds Nikola Jokic`           (filtra por jugador)\n"
+    "• `/live`   → top props en vivo (auto) + scoring\n\n"
     "Opcional manual:\n"
     "• `/add Nombre | tipo | side | linea`\n"
     "   Ej: `/add Jalen Duren | puntos | over | 15.5`\n"
@@ -719,86 +764,95 @@ async def cmd_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hr = home.get("wins", None)
         hl = home.get("losses", None)
         status = g.get("gameStatusText", "")
-        rec_away = f"{ar}-{al}" if ar is not None and al is not None else "—"
-        rec_home = f"{hr}-{hl}" if hr is not None and hl is not None else "—"
-        lines.append(f"• *{at}* ({rec_away}) @ *{ht}* ({rec_home}) — _{status}_")
+        rec_away = f"{ar}-{al}" if ar is not None and al is not None else ""
+        rec_home = f"{hr}-{hl}" if hr is not None and hl is not None else ""
+        slug = _slug_from_scoreboard_game(g)
+        lines.append(f"• {at} ({rec_away}) @ {ht} ({rec_home}) — {status}\n  `slug: {slug}`")
 
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    msg = "\n".join(lines)
+    if len(msg) > 3800:
+        msg = msg[:3800] + "\n…(recortado)"
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+def _group_props_pretty(props_pm: List[Prop]) -> Dict[str, Dict[str, Dict[Tuple[str, float], Dict[str, bool]]]]:
+    """
+    game_slug -> player -> (tipo,line) -> {"over":bool,"under":bool}
+    """
+    out: Dict[str, Dict[str, Dict[Tuple[str, float], Dict[str, bool]]]] = {}
+    for p in props_pm:
+        slug = p.game_slug or "unknown"
+        out.setdefault(slug, {})
+        out[slug].setdefault(p.player, {})
+        key = (p.tipo, float(p.line))
+        out[slug][p.player].setdefault(key, {"over": False, "under": False})
+        if p.side in ("over", "under"):
+            out[slug][p.player][key][p.side] = True
+    return out
 
 async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    flt = _odds_filter_from_text(update.message.text or "")
     props_pm = polymarket_props_today_from_scoreboard()
     if not props_pm:
         await update.message.reply_text("No pude parsear props P/R/A desde Polymarket (0 encontrados).")
         return
 
-    # aplica filtro si existe
-    if flt:
-        props_pm = [p for p in props_pm if _match_filter(p, flt)]
+    args = context.args or []
+    slug_filter = None
+    player_filter = None
+
+    if args:
+        q = " ".join(args).strip()
+        if q.lower().startswith("nba-"):
+            slug_filter = q.lower()
+        else:
+            player_filter = q.lower()
+
+    if slug_filter:
+        props_pm = [p for p in props_pm if (p.game_slug or "").lower() == slug_filter]
         if not props_pm:
-            await update.message.reply_text(f"No encontré props en Polymarket para el filtro: `{flt}`", parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(f"No encontré props para ese partido.\n`{slug_filter}`", parse_mode=ParseMode.MARKDOWN)
             return
 
-    # game -> player -> tipo -> line -> set(sides)
-    tree = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(set))))
-    for p in props_pm:
-        g = (p.game_slug or "unknown").strip()
-        player = (p.player or "").strip()
-        tipo = (p.tipo or "").lower().strip()
-        side = (p.side or "").lower().strip()
-        if not player or tipo not in ("puntos", "rebotes", "asistencias") or side not in ("over", "under"):
-            continue
-        try:
-            ln = float(p.line)
-        except Exception:
-            continue
-        tree[g][player][tipo][ln].add(side)
+    if player_filter:
+        props_pm = [p for p in props_pm if player_filter in (p.player or "").lower()]
+        if not props_pm:
+            await update.message.reply_text(f"No encontré props para ese jugador.\n`{player_filter}`", parse_mode=ParseMode.MARKDOWN)
+            return
 
-    if not tree:
-        await update.message.reply_text("No pude parsear props P/R/A desde Polymarket (0 encontrados).")
-        return
+    grouped = _group_props_pretty(props_pm)
 
-    # render
-    title = "🟣 *Polymarket — Props P/R/A (auto)*"
-    if flt:
-        title += f"\nFiltro: `{flt}`"
-    lines = [title]
-
-    # orden de stats
-    order_tipo = {"puntos": 0, "asistencias": 1, "rebotes": 2}
-
-    for game_slug in sorted(tree.keys()):
-        lines.append(f"\n🏟️ *{game_slug}*")
-        for player in sorted(tree[game_slug].keys()):
-            lines.append(f"👤 *{player}*")
-            tipos = tree[game_slug][player]
-            for tipo in sorted(tipos.keys(), key=lambda x: order_tipo.get(x, 99)):
-                ln_map = tipos[tipo]  # line -> sides
-                parts = []
-                for ln in sorted(ln_map.keys()):
-                    sides = ln_map[ln]
-                    if "over" in sides and "under" in sides:
-                        parts.append(f"O/U {_fmt_line(ln)}")
-                    elif "over" in sides:
-                        parts.append(f"O {_fmt_line(ln)}")
-                    elif "under" in sides:
-                        parts.append(f"U {_fmt_line(ln)}")
-                if parts:
-                    lines.append(f"  • {_fmt_tipo(tipo)}: " + " | ".join(parts))
+    lines = ["🟣 *Polymarket — Props P/R/A (auto)*"]
+    for slug in sorted(grouped.keys()):
+        lines.append(f"\n*{slug}*")
+        players_sorted = sorted(grouped[slug].keys())
+        for pl in players_sorted:
+            lines.append(f"👤 *{pl}*")
+            entries = grouped[slug][pl]
+            # orden: puntos, rebotes, asistencias; luego line asc
+            tipo_order = {"puntos": 0, "rebotes": 1, "asistencias": 2}
+            for (tipo, ln) in sorted(entries.keys(), key=lambda x: (tipo_order.get(x[0], 9), x[1])):
+                flags = entries[(tipo, ln)]
+                o = "O" if flags.get("over") else "-"
+                u = "U" if flags.get("under") else "-"
+                lines.append(f"  • {tipo}: {o} {ln} | {u} {ln}")
 
     msg = "\n".join(lines)
-    if len(msg) > 3900:
-        msg = msg[:3900] + "\n…(recortado)"
+    if len(msg) > 3800:
+        msg = msg[:3800] + "\n…(recortado)"
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # props manuales + polymarket
-    props = load_props()
+    props_manual = load_props()
     props_pm = polymarket_props_today_from_scoreboard()
-    all_props = (props or []) + (props_pm or [])
+    all_props = (props_manual or []) + (props_pm or [])
 
     if not all_props:
-        await update.message.reply_text("No pude cargar props (ni props.json ni Polymarket).")
+        await update.message.reply_text(
+            "No tengo props cargados.\n"
+            "• Intenta `/odds` (auto)\n"
+            "• O agrega manual con `/add ...`\n",
+            parse_mode=ParseMode.MARKDOWN
+        )
         return
 
     # juegos live
@@ -810,7 +864,7 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     live_games = [g for g in games if g.get("gameStatus") == 2]
     if not live_games:
-        await update.message.reply_text("No hay partidos en vivo ahora.")
+        await update.message.reply_text("No hay partidos en vivo ahora.\nUsa `/games` o `/today` para ver la cartelera.", parse_mode=ParseMode.MARKDOWN)
         return
 
     # index props por jugador (pid)
@@ -894,11 +948,11 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
         side_tag = "OVER" if pr.side == "over" else "UNDER"
         extra = f"faltan {delta:.1f}" if pr.side == "over" else f"colchón {delta:.1f}"
         out.append(
-            f"\n*{pr.player}* — {pr.tipo} {side_tag} {pr.line}\n"
-            f"FINAL `{final}` (LIVE {live} | PRE {pre}) | {actual} ({extra})\n"
+            f"\n👤 *{pr.player}*\n"
+            f"• {pr.tipo} {side_tag} {pr.line}\n"
+            f"FINAL `{final}` (LIVE {live} | PRE {pre}) | actual={actual} ({extra})\n"
             f"{status} | Q{period} {clock} | MIN {mins:.1f} PF {pf} Diff {diff}\n"
-            f"Forma: 5={meta['hits5']}/{meta['n5']} 10={meta['hits10']}/{meta['n10']}\n"
-            f"Fuente: {pr.source}"
+            f"Forma: 5={meta['hits5']}/{meta['n5']} 10={meta['hits10']}/{meta['n10']} | fuente={pr.source}"
         )
 
     msg = "\n".join(out)
@@ -906,14 +960,12 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = msg[:3800] + "\n…(recortado)"
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
-
 # =========================
-# Background scan: auto-props PM + props.json
+# Background scan
 # =========================
 async def background_scan(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
 
-    # manual + polymarket
     props_manual = load_props()
     props_pm = polymarket_props_today_from_scoreboard()
     props = (props_manual or []) + (props_pm or [])
@@ -922,7 +974,6 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
 
     state = load_alert_state()
 
-    # pid -> props
     by_pid: Dict[int, List[Prop]] = {}
     for p in props:
         pid = get_pid_for_name(p.player)
@@ -999,7 +1050,7 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
                                     f"📊 {pr.tipo.upper()} {actual}/{pr.line} (faltan {faltante:.1f})\n"
                                     f"⏱️ {status} | Q{period} {game_clock}\n"
                                     f"🧠 MIN {mins:.1f} | PF {pf} | Diff {diff}\n"
-                                    f"📈 Forma: hit5 {meta['hits5']}/{meta['n5']} | hit10 {meta['hits10']}/{meta['n10']}\n"
+                                    f"📈 Forma: 5={meta['hits5']}/{meta['n5']} | 10={meta['hits10']}/{meta['n10']}\n"
                                     f"🔌 Fuente: {pr.source}\n"
                                 )
                                 await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.MARKDOWN)
@@ -1021,13 +1072,12 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
                                     f"📊 {pr.tipo.upper()} {actual}/{pr.line} (colchón {margin_under:.1f})\n"
                                     f"⏱️ {status} | Q{period} {game_clock}\n"
                                     f"🧠 MIN {mins:.1f} | PF {pf} | Diff {diff}\n"
-                                    f"📈 Forma: hit5 {meta['hits5']}/{meta['n5']} | hit10 {meta['hits10']}/{meta['n10']}\n"
+                                    f"📈 Forma: 5={meta['hits5']}/{meta['n5']} | 10={meta['hits10']}/{meta['n10']}\n"
                                     f"🔌 Fuente: {pr.source}\n"
                                 )
                                 await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.MARKDOWN)
 
     save_alert_state(state)
-
 
 # =========================
 # Main
@@ -1056,7 +1106,7 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("games", cmd_games))
-    app.add_handler(CommandHandler("today", cmd_games))   # ✅ alias /today
+    app.add_handler(CommandHandler("today", cmd_games))   # ✅ alias
     app.add_handler(CommandHandler("odds", cmd_odds))
     app.add_handler(CommandHandler("live", cmd_live))
 
