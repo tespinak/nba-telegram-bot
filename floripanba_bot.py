@@ -8,7 +8,8 @@ import asyncio
 import logging
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timezone, date
+from datetime import date
+from collections import defaultdict
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -497,15 +498,14 @@ _TIPO_MAP = {"points": "puntos", "rebounds": "rebotes", "assists": "asistencias"
 # Ej:
 # "Isaiah Hartenstein: Assists O/U 3.5"
 # "Cade Cunningham: Points O/U 25.5"
-_PM_Q_RE = re.compile(r"^(?P<player>.+?):\s*(?P<stat>Points|Rebounds|Assists)\s*O\/U\s*(?P<line>\d+(?:\.\d+)?)",
-                      re.IGNORECASE)
+_PM_Q_RE = re.compile(
+    r"^(?P<player>.+?):\s*(?P<stat>Points|Rebounds|Assists)\s*O\/U\s*(?P<line>\d+(?:\.\d+)?)",
+    re.IGNORECASE
+)
 
 def _slug_from_scoreboard_game(g: dict) -> str:
-    # Slug estándar Polymarket: nba-{away}-{home}-{yyyy-mm-dd}
-    # con tricodes, ej okc det
     away = (g.get("awayTeam", {}) or {}).get("teamTricode", "").lower()
     home = (g.get("homeTeam", {}) or {}).get("teamTricode", "").lower()
-    # fecha del scoreboard: hoy
     d = date.today().isoformat()
     return f"nba-{away}-{home}-{d}"
 
@@ -539,19 +539,12 @@ def polymarket_props_from_event(event_json: dict) -> List[Prop]:
         if mm:
             player = mm.group("player").strip()
             parsed_line = float(mm.group("line"))
-        else:
-            # fallback: intenta extraer "X: Assists O/U 3.5" sin depender regex exacto
-            # o si falta el "O/U" en el texto (raro)
-            pass
 
         if line is None and parsed_line is None:
             continue
 
         line_val = float(line if line is not None else parsed_line)
 
-        # Cada market es Yes/No:
-        # Yes = más de la línea => OVER
-        # No  = línea o menos   => UNDER
         market_id = str(m.get("id") or "")
         tipo = _TIPO_MAP.get(smt)
         if not tipo or not player:
@@ -563,7 +556,6 @@ def polymarket_props_from_event(event_json: dict) -> List[Prop]:
     return out
 
 def polymarket_props_today_from_scoreboard() -> List[Prop]:
-    # cache por día
     today = date.today().isoformat()
     now = now_ts()
     if PM_CACHE["date"] == today and (now - PM_CACHE["ts"]) < PM_TTL_SECONDS:
@@ -599,14 +591,56 @@ def polymarket_props_today_from_scoreboard() -> List[Prop]:
 
 
 # =========================
+# Pretty formatting for /odds
+# =========================
+def _fmt_tipo(tipo: str) -> str:
+    t = (tipo or "").lower().strip()
+    if t == "puntos":
+        return "Puntos"
+    if t == "rebotes":
+        return "Rebotes"
+    if t == "asistencias":
+        return "Asistencias"
+    return tipo
+
+def _fmt_line(x: float) -> str:
+    try:
+        xf = float(x)
+        return str(int(xf)) if xf.is_integer() else str(xf)
+    except Exception:
+        return str(x)
+
+def _odds_filter_from_text(text: str) -> str:
+    # /odds algo...
+    t = (text or "").strip()
+    t = re.sub(r"^/odds(@\w+)?\s*", "", t).strip()
+    return t
+
+def _match_filter(prop: Prop, flt: str) -> bool:
+    if not flt:
+        return True
+    f = flt.lower().strip()
+    # si parece slug o parte de slug
+    if "nba-" in f or "-" in f:
+        gs = (prop.game_slug or "").lower()
+        return f in gs
+    # si no, se asume filtro por jugador
+    return f in (prop.player or "").lower()
+
+
+# =========================
 # Commands
 # =========================
 HELP_TEXT = (
     "🧠 *NBA Interactive Bot*\n\n"
     "Comandos:\n"
-    "• `/games`  → programación NBA de hoy\n"
-    "• `/odds`   → props P/R/A de Polymarket (auto)\n"
-    "• `/live`   → top props en vivo (auto) + scoring\n\n"
+    "• `/games` o `/today` → programación NBA de hoy\n"
+    "• `/odds` → props P/R/A de Polymarket (auto)\n"
+    "   Filtros:\n"
+    "   - `/odds okc-det` (match parcial)\n"
+    "   - `/odds nba-okc-det-2026-02-25` (slug exacto)\n"
+    "   - `/odds jokic` (por jugador)\n"
+    "• `/live` → top props en vivo (auto) + scoring\n\n"
     "Opcional manual:\n"
     "• `/add Nombre | tipo | side | linea`\n"
     "   Ej: `/add Jalen Duren | puntos | over | 15.5`\n"
@@ -685,36 +719,76 @@ async def cmd_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hr = home.get("wins", None)
         hl = home.get("losses", None)
         status = g.get("gameStatusText", "")
-        # records a veces vienen en live scoreboard
-        rec_away = f"{ar}-{al}" if ar is not None and al is not None else ""
-        rec_home = f"{hr}-{hl}" if hr is not None and hl is not None else ""
-        lines.append(f"• {at} ({rec_away}) @ {ht} ({rec_home}) — {status}")
+        rec_away = f"{ar}-{al}" if ar is not None and al is not None else "—"
+        rec_home = f"{hr}-{hl}" if hr is not None and hl is not None else "—"
+        lines.append(f"• *{at}* ({rec_away}) @ *{ht}* ({rec_home}) — _{status}_")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    flt = _odds_filter_from_text(update.message.text or "")
     props_pm = polymarket_props_today_from_scoreboard()
     if not props_pm:
         await update.message.reply_text("No pude parsear props P/R/A desde Polymarket (0 encontrados).")
         return
 
-    # agrupa por game_slug
-    by_game: Dict[str, List[Prop]] = {}
-    for p in props_pm:
-        by_game.setdefault(p.game_slug or "unknown", []).append(p)
+    # aplica filtro si existe
+    if flt:
+        props_pm = [p for p in props_pm if _match_filter(p, flt)]
+        if not props_pm:
+            await update.message.reply_text(f"No encontré props en Polymarket para el filtro: `{flt}`", parse_mode=ParseMode.MARKDOWN)
+            return
 
-    # muestra resumen (limitado)
-    lines = ["🟣 *Polymarket — Props P/R/A (auto)*"]
-    for slug, plist in sorted(by_game.items(), key=lambda x: x[0])[:8]:
-        # muestra 10 props (pares over/under ya están incluidos)
-        sample = plist[:10]
-        lines.append(f"\n*{slug}*")
-        for p in sample:
-            lines.append(f"• {p.player} — {p.tipo} {p.side} {p.line}")
+    # game -> player -> tipo -> line -> set(sides)
+    tree = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: defaultdict(set))))
+    for p in props_pm:
+        g = (p.game_slug or "unknown").strip()
+        player = (p.player or "").strip()
+        tipo = (p.tipo or "").lower().strip()
+        side = (p.side or "").lower().strip()
+        if not player or tipo not in ("puntos", "rebotes", "asistencias") or side not in ("over", "under"):
+            continue
+        try:
+            ln = float(p.line)
+        except Exception:
+            continue
+        tree[g][player][tipo][ln].add(side)
+
+    if not tree:
+        await update.message.reply_text("No pude parsear props P/R/A desde Polymarket (0 encontrados).")
+        return
+
+    # render
+    title = "🟣 *Polymarket — Props P/R/A (auto)*"
+    if flt:
+        title += f"\nFiltro: `{flt}`"
+    lines = [title]
+
+    # orden de stats
+    order_tipo = {"puntos": 0, "asistencias": 1, "rebotes": 2}
+
+    for game_slug in sorted(tree.keys()):
+        lines.append(f"\n🏟️ *{game_slug}*")
+        for player in sorted(tree[game_slug].keys()):
+            lines.append(f"👤 *{player}*")
+            tipos = tree[game_slug][player]
+            for tipo in sorted(tipos.keys(), key=lambda x: order_tipo.get(x, 99)):
+                ln_map = tipos[tipo]  # line -> sides
+                parts = []
+                for ln in sorted(ln_map.keys()):
+                    sides = ln_map[ln]
+                    if "over" in sides and "under" in sides:
+                        parts.append(f"O/U {_fmt_line(ln)}")
+                    elif "over" in sides:
+                        parts.append(f"O {_fmt_line(ln)}")
+                    elif "under" in sides:
+                        parts.append(f"U {_fmt_line(ln)}")
+                if parts:
+                    lines.append(f"  • {_fmt_tipo(tipo)}: " + " | ".join(parts))
 
     msg = "\n".join(lines)
-    if len(msg) > 3800:
-        msg = msg[:3800] + "\n…(recortado)"
+    if len(msg) > 3900:
+        msg = msg[:3900] + "\n…(recortado)"
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -782,7 +856,6 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 for pr in by_pid[pid]:
                     actual = pts if pr.tipo == "puntos" else (reb if pr.tipo == "rebotes" else ast)
-
                     pre, meta = pre_score(pid, pr.tipo, pr.line, pr.side)
 
                     if pr.side == "over":
@@ -798,7 +871,6 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                         live = compute_over_score(pr.tipo, faltante, mins, pf, period, clock_sec, diff, is_clutch, is_blowout)
                         final = int(clamp(0.55 * live + 0.45 * pre, 0, 100))
-
                         scored_rows.append((final, live, pre, pr, actual, faltante, status, period, game_clock, mins, pf, diff, meta))
 
                     else:
@@ -825,7 +897,8 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"\n*{pr.player}* — {pr.tipo} {side_tag} {pr.line}\n"
             f"FINAL `{final}` (LIVE {live} | PRE {pre}) | {actual} ({extra})\n"
             f"{status} | Q{period} {clock} | MIN {mins:.1f} PF {pf} Diff {diff}\n"
-            f"Forma: 5={meta['hits5']}/{meta['n5']} 10={meta['hits10']}/{meta['n10']}"
+            f"Forma: 5={meta['hits5']}/{meta['n5']} 10={meta['hits10']}/{meta['n10']}\n"
+            f"Fuente: {pr.source}"
         )
 
     msg = "\n".join(out)
@@ -983,6 +1056,7 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("games", cmd_games))
+    app.add_handler(CommandHandler("today", cmd_games))   # ✅ alias /today
     app.add_handler(CommandHandler("odds", cmd_odds))
     app.add_handler(CommandHandler("live", cmd_live))
 
