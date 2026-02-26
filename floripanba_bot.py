@@ -7,7 +7,7 @@ import random
 import asyncio
 import logging
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime, timezone, date
 
 import requests
@@ -35,7 +35,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 if not TELEGRAM_TOKEN:
     raise RuntimeError("Missing TELEGRAM_TOKEN env var (set it in Railway Variables)")
 
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "120"))
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "60"))
 SEASON = os.environ.get("NBA_SEASON", "2025-26")
 
 PROPS_FILE = "props.json"
@@ -43,6 +43,10 @@ ALERTS_STATE_FILE = "alerts_state.json"
 IDS_CACHE_FILE = "player_ids_cache.json"
 GLOG_CACHE_FILE = "gamelog_cache.json"
 PREGAME_STATE_FILE = "pregame_state.json"
+SIGNALS_LOG_FILE = "signals_log.jsonl"
+MAX_ALERTS_PER_SCAN = int(os.environ.get("MAX_ALERTS_PER_SCAN", "8"))
+RESULTS_DEFAULT_LIMIT = int(os.environ.get("RESULTS_DEFAULT_LIMIT", "8"))
+RAILWAY_PUBLIC_DOMAIN = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
 
 # thresholds / scoring
 FINAL_ALERT_THRESHOLD = 75
@@ -129,6 +133,60 @@ def clamp(x, lo=0, hi=100):
     return max(lo, min(hi, x))
 
 
+def log_signal_event(event: dict):
+    try:
+        payload = dict(event)
+        payload.setdefault("ts", now_ts())
+        with open(SIGNALS_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log.warning("No pude guardar señal en %s: %s", SIGNALS_LOG_FILE, e)
+
+
+def read_signal_events(limit: int = 20) -> List[dict]:
+    if limit <= 0:
+        return []
+    if not os.path.exists(SIGNALS_LOG_FILE):
+        return []
+    try:
+        with open(SIGNALS_LOG_FILE, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception as e:
+        log.warning("No pude leer %s: %s", SIGNALS_LOG_FILE, e)
+        return []
+
+    out: List[dict] = []
+    for line in lines[-limit:]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                out.append(obj)
+        except Exception:
+            continue
+    return out
+
+
+def ts_to_hhmm(ts: Any) -> str:
+    try:
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%H:%M UTC")
+    except Exception:
+        return "--:-- UTC"
+
+
+def env_check_summary() -> List[str]:
+    token_status = "OK" if TELEGRAM_TOKEN else "MISSING"
+    return [
+        f"TELEGRAM_TOKEN: {token_status}",
+        f"NBA_SEASON: {SEASON}",
+        f"POLL_SECONDS: {POLL_SECONDS}",
+        f"MAX_ALERTS_PER_SCAN: {MAX_ALERTS_PER_SCAN}",
+        f"RAILWAY_PUBLIC_DOMAIN: {RAILWAY_PUBLIC_DOMAIN or '(no configurado)'}",
+    ]
+
+
 # =========================
 # Data model
 # =========================
@@ -147,7 +205,8 @@ def load_props() -> List[Prop]:
     for p in raw.get("props", []):
         try:
             out.append(Prop(**p))
-        except Exception:
+        except Exception as e:
+            log.warning("Prop inválida en %s: %s (%s)", PROPS_FILE, p, e)
             continue
     return out
 
@@ -621,7 +680,9 @@ HELP_TEXT = (
     "Comandos:\n"
     "• `/today` → programación NBA de hoy\n"
     "• `/odds`  → props P/R/A de Polymarket (sin cuotas)\n"
-    "• `/live`  → estado en vivo de tus props (si cargaste props.json)\n\n"
+    "• `/live`  → estado en vivo de tus props (si cargaste props.json)\n"
+    "• `/results [N]` → últimas señales emitidas (desde signals_log.jsonl)\n"
+    "• `/status` → chequeo rápido para deploy en Railway\n\n"
     "Opcional:\n"
     "• `/add Nombre | tipo | side | linea`\n"
     "   Ej: `/add Nikola Jokic | asistencias | under | 9.5`\n"
@@ -728,6 +789,56 @@ async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• {p['player']} — {p['tipo']} {p['side'].upper()} {p['line']}")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = ["🛠️ *Estado del bot*"]
+    lines.extend([f"• {x}" for x in env_check_summary()])
+
+    props_count = len(load_props())
+    lines.append(f"• Props manuales cargadas: {props_count}")
+
+    recent = read_signal_events(limit=1)
+    if recent:
+        ev = recent[-1]
+        lines.append(
+            f"• Última señal: {ts_to_hhmm(ev.get('ts'))} | {ev.get('player', '?')} | {str(ev.get('tipo', '?')).upper()} {str(ev.get('side', '?')).upper()} {ev.get('line', '?')}"
+        )
+    else:
+        lines.append("• Última señal: (sin datos todavía)")
+
+    lines.append("\nTip Railway: despliega, abre Telegram, ejecuta /start y luego /status.")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    n = RESULTS_DEFAULT_LIMIT
+    if context.args and len(context.args) >= 1:
+        try:
+            n = int(context.args[0])
+        except Exception:
+            n = RESULTS_DEFAULT_LIMIT
+    n = max(1, min(30, n))
+
+    events = read_signal_events(limit=n)
+    if not events:
+        await update.message.reply_text("No hay señales registradas todavía en signals_log.jsonl.")
+        return
+
+    lines = ["📒 *Últimas señales emitidas*"]
+    for ev in reversed(events):
+        player = ev.get("player", "?")
+        tipo = str(ev.get("tipo", "?")).upper()
+        side = str(ev.get("side", "?")).upper()
+        line = ev.get("line", "?")
+        actual = ev.get("actual", "?")
+        final = ev.get("final", "?")
+        game_status = ev.get("status", "")
+        t = ts_to_hhmm(ev.get("ts"))
+        lines.append(f"• {t} | {player} — {tipo} {side} {line} | act {actual} | score {final} | {game_status}")
+
+    msg = "\n".join(lines)
+    await update.message.reply_text(msg[:3900], parse_mode=ParseMode.MARKDOWN)
+
+
 async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
     props = load_props()
     if not props:
@@ -761,7 +872,8 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         try:
             box = boxscore.BoxScore(gid).get_dict()["game"]
-        except Exception:
+        except Exception as e:
+            log.warning("No pude leer boxscore gameId=%s: %s", gid, e)
             continue
 
         for team_key in ["homeTeam", "awayTeam"]:
@@ -810,7 +922,8 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
     # games
     try:
         games = scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"]
-    except Exception:
+    except Exception as e:
+        log.warning("No pude leer scoreboard en background_scan: %s", e)
         return
 
     # --- Pregame: Featured + T-90 ---
@@ -875,7 +988,8 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
         try:
             pm = build_polymarket_universe_par(limit_events=250)
             props = [Prop(player=p["player"], tipo=p["tipo"], side=p["side"], line=float(p["line"])) for p in pm]
-        except Exception:
+        except Exception as e:
+            log.warning("No pude construir universo Polymarket automático: %s", e)
             return
 
     if not props:
@@ -891,7 +1005,11 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
             by_pid.setdefault(pid, []).append(p)
 
     # LIVE scan
+    alerts_sent_scan = 0
+    stop_scan = False
     for g in games:
+        if stop_scan:
+            break
         if g.get("gameStatus") != 2:
             continue
 
@@ -915,7 +1033,8 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
 
         try:
             box = boxscore.BoxScore(gid).get_dict()["game"]
-        except Exception:
+        except Exception as e:
+            log.warning("No pude leer boxscore gameId=%s: %s", gid, e)
             continue
 
         for team_key in ["homeTeam", "awayTeam"]:
@@ -933,6 +1052,8 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
                 mins = parse_minutes(s.get("minutes", ""))
 
                 for pr in by_pid[pid]:
+                    if stop_scan:
+                        break
                     actual = pts if pr.tipo == "puntos" else (reb if pr.tipo == "rebotes" else ast)
 
                     # PRE
@@ -964,6 +1085,15 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
                                     f"📈 Forma: hit5 {meta['hits5']}/{meta['n5']} | hit10 {meta['hits10']}/{meta['n10']}\n"
                                 )
                                 await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.MARKDOWN)
+                                log_signal_event({
+                                    "chat_id": chat_id, "game_id": gid, "player_id": pid, "player": name,
+                                    "tipo": pr.tipo, "side": pr.side, "line": pr.line, "actual": actual,
+                                    "final": final, "live": live, "pre": pre_sc, "status": status, "period": period
+                                })
+                                alerts_sent_scan += 1
+                                if alerts_sent_scan >= MAX_ALERTS_PER_SCAN:
+                                    stop_scan = True
+                                    break
 
                     else:
                         margin_under = float(pr.line) - float(actual)
@@ -985,6 +1115,15 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
                                     f"📈 Forma: hit5 {meta['hits5']}/{meta['n5']} | hit10 {meta['hits10']}/{meta['n10']}\n"
                                 )
                                 await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.MARKDOWN)
+                                log_signal_event({
+                                    "chat_id": chat_id, "game_id": gid, "player_id": pid, "player": name,
+                                    "tipo": pr.tipo, "side": pr.side, "line": pr.line, "actual": actual,
+                                    "final": final, "live": live, "pre": pre_sc, "status": status, "period": period
+                                })
+                                alerts_sent_scan += 1
+                                if alerts_sent_scan >= MAX_ALERTS_PER_SCAN:
+                                    stop_scan = True
+                                    break
 
     save_alert_state(state)
 
@@ -994,6 +1133,8 @@ async def background_scan(context: ContextTypes.DEFAULT_TYPE):
 # =========================
 async def on_startup(app: Application):
     log.info("Bot arrancado. Background scan via /start.")
+    for line in env_check_summary():
+        log.info("%s", line)
 
 async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -1019,6 +1160,8 @@ def main():
     app.add_handler(CommandHandler("odds", cmd_odds))
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("live", cmd_live))
+    app.add_handler(CommandHandler("results", cmd_results))
+    app.add_handler(CommandHandler("status", cmd_status))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
