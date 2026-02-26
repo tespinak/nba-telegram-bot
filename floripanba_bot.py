@@ -1267,7 +1267,6 @@ async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     # ── 3. Agrupar props únicos por partido y jugador ──
-    # slug → player → lista de líneas únicas
     grouped_unique: Dict[str, Dict[str, List[Tuple[str, float, str]]]] = {}
     seen_lines: set = set()
     for p in filtered:
@@ -1303,65 +1302,115 @@ async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(header, parse_mode=ParseMode.MARKDOWN)
 
-    # ── 5. Procesar y enviar partido a partido ──
+    # ── 5. Semáforo: máximo 4 threads simultáneos a NBA API ──
+    sem = asyncio.Semaphore(4)
+
+    async def compute_player_safe(player_name: str, lineas: List[Tuple[str, float, str]]) -> Tuple[str, List[dict]]:
+        async with sem:
+            results = []
+            for (tipo, line, source) in lineas:
+                try:
+                    entry = await asyncio.wait_for(
+                        asyncio.to_thread(_compute_pre_for_player, player_name, tipo, line, source),
+                        timeout=30.0
+                    )
+                except asyncio.TimeoutError:
+                    log.warning(f"Timeout calculando {player_name} {tipo}")
+                    entry = {"tipo": tipo, "line": line, "source": source,
+                             "pre_over": 0, "pre_under": 0, "meta_over": {}, "pid": None}
+                except Exception as e:
+                    log.warning(f"Error calculando {player_name}: {e}")
+                    entry = {"tipo": tipo, "line": line, "source": source,
+                             "pre_over": 0, "pre_under": 0, "meta_over": {}, "pid": None}
+                results.append(entry)
+            return player_name, results
+
+    # ── 6. Procesar partido a partido ──
     for slug in sorted(grouped_unique.keys()):
         matchup = _slug_to_matchup(slug)
         players_in_game = grouped_unique[slug]
 
-        # Actualizar mensaje de loading con progreso
         try:
             await msg_loading.edit_text(
-                f"⚡ *Calculando...*\n🏀 _{matchup}_",
+                f"⚡ *Calculando...*\n🏀 _{matchup}_ ({len(players_in_game)} jugadores)",
                 parse_mode=ParseMode.MARKDOWN
             )
         except Exception:
             pass
 
-        # Calcular PRE scores de todos los jugadores del partido en threads
-        # Cada jugador se procesa en paralelo con asyncio.gather
-        async def compute_player(player_name: str, lineas: List[Tuple[str, float, str]]) -> Tuple[str, List[dict]]:
-            results = []
-            for (tipo, line, source) in lineas:
-                entry = await asyncio.to_thread(
-                    _compute_pre_for_player, player_name, tipo, line, source
-                )
-                results.append(entry)
-            return player_name, results
+        # Lanzar todos los jugadores del partido con semáforo (máx 4 a la vez)
+        tasks = [compute_player_safe(pl, lineas) for pl, lineas in players_in_game.items()]
+        try:
+            player_results_raw = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=120.0
+            )
+        except asyncio.TimeoutError:
+            log.warning(f"Timeout global en partido {slug}")
+            await update.message.reply_text(
+                f"⚠️ *{matchup}* — timeout calculando scores, mostrando sin PRE.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            continue
 
-        tasks = [compute_player(pl, lineas) for pl, lineas in players_in_game.items()]
-        player_results_raw = await asyncio.gather(*tasks)
-
-        # Reconstruir dict player → entries
+        # Reconstruir dict player → entries (ignorar excepciones individuales)
         players_data: Dict[str, List[dict]] = {}
-        for pl_name, entries in player_results_raw:
+        for result in player_results_raw:
+            if isinstance(result, Exception):
+                log.warning(f"Excepción en gather: {result}")
+                continue
+            pl_name, entries = result
             players_data[pl_name] = sorted(entries, key=lambda e: tipo_order.get(e["tipo"], 9))
 
-        # Construir y enviar mensaje del partido
-        msg_game = _build_game_message(slug, players_data)
-        if len(msg_game) > 3900:
-            # Partir en dos si es muy largo
-            mid = msg_game[:3900].rfind("\n👤")
-            if mid > 0:
-                part1 = msg_game[:mid]
-                part2 = "_(continuación)_\n" + msg_game[mid:]
-                await update.message.reply_text(part1, parse_mode=ParseMode.MARKDOWN)
-                await update.message.reply_text(part2[:3900], parse_mode=ParseMode.MARKDOWN)
-            else:
-                await update.message.reply_text(msg_game[:3900], parse_mode=ParseMode.MARKDOWN)
-        else:
-            try:
-                await update.message.reply_text(msg_game, parse_mode=ParseMode.MARKDOWN)
-            except Exception as e:
-                log.warning(f"Markdown error en {slug}: {e}")
-                await update.message.reply_text(
-                    msg_game.replace("*","").replace("_","").replace("`","")
-                )
+        if not players_data:
+            continue
 
-    # ── 6. Borrar mensaje de loading al terminar ──
+        # Construir mensaje y partir si es necesario
+        msg_game = _build_game_message(slug, players_data)
+        await _send_long_message(update, msg_game)
+
+    # ── 7. Borrar loading ──
     try:
         await msg_loading.delete()
     except Exception:
         pass
+
+
+async def _send_long_message(update, text: str, max_len: int = 3800):
+    """Envía un mensaje partiéndolo en bloques si supera max_len."""
+    if len(text) <= max_len:
+        try:
+            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            log.warning(f"Markdown error, enviando sin formato: {e}")
+            await update.message.reply_text(text.replace("*","").replace("_","").replace("`",""))
+        return
+
+    # Partir en bloques respetando saltos de jugador
+    parts = []
+    remaining = text
+    while len(remaining) > max_len:
+        # Buscar el último \n👤 antes del límite
+        cut = remaining[:max_len].rfind("\n👤")
+        if cut < 200:
+            # No hay salto limpio, cortar en último \n
+            cut = remaining[:max_len].rfind("\n")
+        if cut < 0:
+            cut = max_len
+        parts.append(remaining[:cut])
+        remaining = remaining[cut:]
+
+    if remaining:
+        parts.append(remaining)
+
+    for i, part in enumerate(parts):
+        prefix = f"_(continuación {i+1}/{len(parts)})_\n" if i > 0 else ""
+        try:
+            await update.message.reply_text(prefix + part, parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            log.warning(f"Markdown error parte {i}: {e}")
+            await update.message.reply_text((prefix + part).replace("*","").replace("_","").replace("`",""))
+        await asyncio.sleep(0.3)  # pequeña pausa entre partes
 
 async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
     props_manual = load_props()
@@ -2481,15 +2530,21 @@ async def cmd_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Solo OVER (el under se analiza independiente)
     props_over = [p for p in props_pm if p.side == "over"]
 
-    # Calcular PRE en paralelo
+    # Calcular PRE con semáforo (máx 4 simultáneos)
+    sem = asyncio.Semaphore(4)
+
     async def _calc_one(p: Prop):
-        def _inner():
-            pid = get_pid_for_name(p.player)
-            if not pid:
-                return None, 0, {}
-            po, pu, meta = pre_score_cached(pid, p.tipo, p.line)
-            return pid, po, meta
-        return p, await asyncio.to_thread(_inner)
+        async with sem:
+            def _inner():
+                pid = get_pid_for_name(p.player)
+                if not pid:
+                    return None, 0, {}
+                po, pu, meta = pre_score_cached(pid, p.tipo, p.line)
+                return pid, po, meta
+            try:
+                return p, await asyncio.wait_for(asyncio.to_thread(_inner), timeout=25.0)
+            except Exception:
+                return p, (None, 0, {})
 
     results = await asyncio.gather(*[_calc_one(p) for p in props_over])
 
