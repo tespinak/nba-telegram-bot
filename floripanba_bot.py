@@ -1086,12 +1086,49 @@ def _group_props_pretty(props_pm: List[Prop]) -> Dict[str, Dict[str, Dict[Tuple[
             out[slug][p.player][key][p.side] = True
     return out
 
+def _pre_rating_emoji(score: int) -> str:
+    """Convierte PRE score en emoji de rating visual."""
+    if score >= 75:
+        return "🔥"
+    elif score >= 60:
+        return "✅"
+    elif score >= 45:
+        return "🟡"
+    elif score >= 30:
+        return "🟠"
+    else:
+        return "❄️"
+
+def _pre_bar(score: int, length: int = 8) -> str:
+    """Barra de progreso visual para el score."""
+    filled = round(score / 100 * length)
+    return "█" * filled + "░" * (length - filled)
+
+def _pre_label(score: int) -> str:
+    if score >= 75: return "FUERTE"
+    elif score >= 60: return "BUENA"
+    elif score >= 45: return "MEDIA"
+    elif score >= 30: return "DÉBIL"
+    else: return "BAJA"
+
+def _slug_to_matchup(slug: str) -> str:
+    """Convierte 'nba-bos-den-2026-02-25' en 'BOS @ DEN'."""
+    parts = slug.replace("nba-", "").split("-")
+    if len(parts) >= 2:
+        away = parts[0].upper()
+        home = parts[1].upper()
+        return f"{away} @ {home}"
+    return slug
+
 async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Cargando props de Polymarket...", parse_mode=ParseMode.MARKDOWN)
+    msg_loading = await update.message.reply_text(
+        "⏳ Cargando props y calculando scores...",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
     props_pm = polymarket_props_today_from_scoreboard()
     if not props_pm:
-        await update.message.reply_text(
+        await msg_loading.edit_text(
             "❌ No pude obtener props de Polymarket ni del fallback.\n"
             "Usa `/debug` para ver qué está pasando.\n"
             "O agrega props manualmente con `/add`.",
@@ -1114,7 +1151,7 @@ async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if slug_filter:
         filtered = [p for p in props_pm if (p.game_slug or "").lower() == slug_filter]
         if not filtered:
-            await update.message.reply_text(
+            await msg_loading.edit_text(
                 f"No encontré props para ese partido.\n`{slug_filter}`\n\n"
                 f"Slugs disponibles:\n" + "\n".join(set(f"`{p.game_slug}`" for p in props_pm[:20])),
                 parse_mode=ParseMode.MARKDOWN
@@ -1124,39 +1161,127 @@ async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if player_filter:
         filtered = [p for p in props_pm if player_filter in (p.player or "").lower()]
         if not filtered:
-            await update.message.reply_text(
+            await msg_loading.edit_text(
                 f"No encontré props para ese jugador: `{player_filter}`",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
 
-    # Contar fuente
-    sources = {}
-    for p in filtered:
-        sources[p.source] = sources.get(p.source, 0) + 1
-    source_info = ", ".join(f"{s}:{n}" for s, n in sources.items())
-
-    grouped = _group_props_pretty(filtered)
-
-    lines = [f"🟣 *Polymarket — Props P/R/A* ({source_info})"]
+    # Calcular PRE score para cada prop (solo over, el under es espejo)
+    # Estructura: player_name -> (tipo, line) -> (pre_over, pre_under, meta)
     tipo_order = {"puntos": 0, "rebotes": 1, "asistencias": 2}
+    tipo_icon = {"puntos": "🏀", "rebotes": "💪", "asistencias": "🎯"}
 
-    for slug in sorted(grouped.keys()):
-        lines.append(f"\n*{slug}*")
-        players_sorted = sorted(grouped[slug].keys())
+    # Agrupar props únicos: slug -> player -> (tipo, line) -> sides
+    # Además calculamos PRE para each
+    grouped_data: Dict[str, Dict[str, List[dict]]] = {}
+
+    # Primero agrupamos todos los props únicos (over+under juntos)
+    seen_lines: set = set()
+    for p in filtered:
+        if p.side != "over":
+            continue  # procesamos solo over para no duplicar
+        key = (p.game_slug, p.player, p.tipo, p.line)
+        if key in seen_lines:
+            continue
+        seen_lines.add(key)
+
+        slug = p.game_slug or "unknown"
+        grouped_data.setdefault(slug, {})
+        grouped_data[slug].setdefault(p.player, [])
+
+        # Calcular PRE scores
+        pid = get_pid_for_name(p.player)
+        if pid:
+            pre_over, meta_over = pre_score(pid, p.tipo, p.line, "over")
+            pre_under, meta_under = pre_score(pid, p.tipo, p.line, "under")
+        else:
+            pre_over, meta_over = 0, {}
+            pre_under, meta_under = 0, {}
+
+        grouped_data[slug][p.player].append({
+            "tipo": p.tipo,
+            "line": p.line,
+            "pre_over": pre_over,
+            "pre_under": pre_under,
+            "meta_over": meta_over,
+            "source": p.source,
+        })
+
+    # Construir mensajes por partido (un mensaje por partido para no superar límite)
+    total_props = sum(len(pls) for g in grouped_data.values() for pls in g.values())
+    await msg_loading.edit_text(
+        f"⚡ Calculando scores para {total_props} props...",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    all_messages = []
+
+    for slug in sorted(grouped_data.keys()):
+        matchup = _slug_to_matchup(slug)
+        lines = [f"🟣 *{matchup}*  _{slug}_\n{'─'*30}"]
+
+        players_data = grouped_data[slug]
+        # Ordenar jugadores por su mejor score (over o under) descendente
+        def best_score(pl_entries):
+            scores = [max(e["pre_over"], e["pre_under"]) for e in pl_entries]
+            return max(scores) if scores else 0
+
+        players_sorted = sorted(players_data.keys(), key=lambda pl: best_score(players_data[pl]), reverse=True)
+
         for pl in players_sorted:
-            lines.append(f"👤 *{pl}*")
-            entries = grouped[slug][pl]
-            for (tipo, ln) in sorted(entries.keys(), key=lambda x: (tipo_order.get(x[0], 9), x[1])):
-                flags = entries[(tipo, ln)]
-                o = "O" if flags.get("over") else "-"
-                u = "U" if flags.get("under") else "-"
-                lines.append(f"  • {tipo}: {o} {ln} | {u} {ln}")
+            entries = sorted(players_data[pl], key=lambda e: tipo_order.get(e["tipo"], 9))
+            lines.append(f"\n👤 *{pl}*")
 
-    msg = "\n".join(lines)
-    if len(msg) > 3800:
-        msg = msg[:3800] + "\n…(recortado)"
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+            for e in entries:
+                tipo = e["tipo"]
+                ln = e["line"]
+                po = e["pre_over"]
+                pu = e["pre_under"]
+                icon = tipo_icon.get(tipo, "•")
+                meta = e.get("meta_over", {})
+
+                # Hits form string
+                h5 = meta.get("hits5", "?")
+                n5 = meta.get("n5", "?")
+                h10 = meta.get("hits10", "?")
+                n10 = meta.get("n10", "?")
+                avg10 = meta.get("avg10", None)
+
+                avg_str = f"prom10: {avg10:.1f}" if avg10 is not None else ""
+
+                lines.append(
+                    f"{icon} *{tipo.upper()}*  línea `{ln}`\n"
+                    f"  OVER  {_pre_rating_emoji(po)} `{po:>3}/100` {_pre_bar(po)} _{_pre_label(po)}_\n"
+                    f"  UNDER {_pre_rating_emoji(pu)} `{pu:>3}/100` {_pre_bar(pu)} _{_pre_label(pu)}_\n"
+                    f"  📊 Forma: `{h5}/{n5}` últimos 5 | `{h10}/{n10}` últimos 10  {avg_str}"
+                )
+
+        all_messages.append("\n".join(lines))
+
+    # Enviar cada partido como mensaje separado
+    await msg_loading.delete()
+
+    # Header global
+    today_str = date.today().strftime("%d/%m/%Y")
+    fuentes = set(p.source for p in filtered)
+    header = (
+        f"📋 *NBA Props — {today_str}*\n"
+        f"🔌 Fuente: {', '.join(fuentes)}  |  {total_props} líneas\n"
+        f"{'─'*32}\n"
+        f"_Score 1-100: 🔥≥75 ✅≥60 🟡≥45 🟠≥30 ❄️<30_"
+    )
+    await update.message.reply_text(header, parse_mode=ParseMode.MARKDOWN)
+
+    for msg_text in all_messages:
+        if len(msg_text) > 3900:
+            msg_text = msg_text[:3900] + "\n…(recortado)"
+        try:
+            await update.message.reply_text(msg_text, parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            log.warning(f"Error enviando mensaje odds: {e}")
+            # Intentar sin markdown si falla
+            await update.message.reply_text(msg_text)
 
 async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
     props_manual = load_props()
