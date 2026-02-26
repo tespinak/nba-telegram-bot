@@ -827,18 +827,32 @@ async def show_game_props_advanced(update: Update, context: ContextTypes.DEFAULT
         async with sem:
             return await asyncio.wait_for(asyncio.to_thread(_calc_player, player, lines), timeout=25.0)
 
-    tasks = [_safe_calc(pl, ln) for pl, ln in unique_lines.items()]
+   tasks = [_safe_calc(pl, ln) for pl, ln in unique_lines.items()]
     try:
         results = await asyncio.gather(*tasks, return_exceptions=True)
-    except:
-        await msg.edit_text("❌ Error de timeout calculando scores.")
+    except Exception as e:
+        await msg.edit_text(f"❌ Error de servidor calculando scores: {e}")
+        return
+
+    # MANEJO SEGURO DE ERRORES: Extraer solo los datos válidos y saltar los Timeouts
+    players_data = {}
+    for item in results:
+        if isinstance(item, Exception):
+            log.warning(f"Error de API en un jugador (saltando): {item}")
+            continue
+        
+        pl, res = item
+        if res:
+            players_data[pl] = res
+
+    if not players_data:
+        await msg.edit_text("❌ La API de la NBA está tardando demasiado o bloqueó la IP temporalmente. Por favor, intenta de nuevo en unos minutos.")
         return
 
     # Formatear el mensaje rico (como en la v2 original)
     tipo_icon = {"puntos": "🏀", "rebotes": "💪", "asistencias": "🎯"}
     tipo_order = {"puntos": 0, "rebotes": 1, "asistencias": 2}
     
-    players_data = {pl: res for pl, res in results if not isinstance(pl, Exception) and not isinstance(res, Exception) and res}
     players_sorted = sorted(players_data.keys(), key=lambda pl: max((max(e["po"], e["pu"]) for e in players_data[pl]), default=0), reverse=True)
 
     lines = [f"🟣 *{matchup}*\n`{slug}`\n{'─'*28}"]
