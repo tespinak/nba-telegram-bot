@@ -20,6 +20,8 @@ from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 from nba_api.live.nba.endpoints import scoreboard, boxscore
@@ -94,10 +96,10 @@ PM_HEADERS = {
 def build_session(headers: dict) -> requests.Session:
     s = requests.Session()
     retry = Retry(
-        total=6,
-        connect=6,
-        read=6,
-        backoff_factor=1.2,
+        total=8,
+        connect=8,
+        read=8,
+        backoff_factor=1.5,
         status_forcelist=(403, 408, 429, 500, 502, 503, 504),
         allowed_methods=frozenset(["GET", "POST"]),
         raise_on_status=False,
@@ -928,9 +930,9 @@ HELP_TEXT = (
     "   `/lineup BOS` → filtrar por equipo\n\n"
 
     "*📊 Props & Análisis*\n"
-    "• `/odds` → props con score PRE v2 (contexto incluido)\n"
-    "   `/odds nba-bos-den-...` → un partido\n"
-    "   `/odds Jokic` → un jugador\n"
+    "• `/odds` → muestra menú de partidos para ver props\n"
+    "   `/odds BOS` → busca partido de un equipo\n"
+    "   `/odds nba-bos-den-...` → slug exacto\n"
     "• `/alertas` → ranking mejores props del día (PRE≥55)\n"
     "• `/analisis Jugador | tipo | side | linea`\n"
     "   → tendencia · racha · H/A · matchup · veredicto\n"
@@ -958,6 +960,7 @@ HELP_TEXT = (
     "*⚙️ Otros*\n"
     "• `/add Jugador | tipo | side | linea` → prop manual\n"
     "• `/debug` → estado técnico Polymarket\n"
+    "• `/miperfil` → ver mi ID y perfil\n"
 )
 
 def parse_add(text: str) -> Optional[Prop]:
@@ -1230,11 +1233,15 @@ def _build_game_message(slug: str, players_data: Dict[str, List[dict]]) -> str:
 
     return "\n".join(lines)
 
+# =========================
+# NUEVO: Sistema interactivo de selección de partidos
+# =========================
 async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tipo_order = {"puntos": 0, "rebotes": 1, "asistencias": 2}
-
+    """
+    /odds - Muestra partidos disponibles y permite seleccionar uno
+    """
     msg_loading = await update.message.reply_text(
-        "⏳ *Cargando props de Polymarket...*",
+        "⏳ *Cargando partidos de hoy...*",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -1248,75 +1255,139 @@ async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ── 2. Filtros opcionales ──
+    # ── 2. Agrupar por partido ──
+    games_dict: Dict[str, List[Prop]] = {}
+    for p in props_pm:
+        slug = p.game_slug or "unknown"
+        games_dict.setdefault(slug, []).append(p)
+
+    # ── 3. Si hay argumento (slug), mostrar ese partido directamente ──
     args = context.args or []
-    slug_filter   = None
-    player_filter = None
     if args:
-        q = " ".join(args).strip()
-        if q.lower().startswith("nba-"):
-            slug_filter = q.lower()
+        slug_filter = " ".join(args).strip().lower()
+        
+        # Buscar por slug exacto
+        if slug_filter in games_dict:
+            await msg_loading.delete()
+            await show_game_props(update, context, slug_filter, games_dict[slug_filter])
+            return
+        
+        # Buscar por equipo (ej: "BOS")
+        for slug in games_dict.keys():
+            matchup = _slug_to_matchup(slug)
+            if slug_filter.upper() in matchup:
+                await msg_loading.delete()
+                await show_game_props(update, context, slug, games_dict[slug])
+                return
+        
+        await msg_loading.edit_text(
+            f"❌ No encontré el partido `{slug_filter}`\n\n"
+            f"Usa `/odds` sin argumentos para ver la lista de partidos.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    # ── 4. Mostrar menú de partidos ──
+    today_str = date.today().strftime("%d/%m/%Y")
+    header = (
+        f"📋 *NBA Props — {today_str}*\n"
+        f"🎮 *Selecciona un partido:*\n"
+        f"{'─'*30}\n"
+    )
+
+    game_lines = []
+    for i, (slug, props) in enumerate(games_dict.items(), 1):
+        matchup = _slug_to_matchup(slug)
+        # Contar jugadores únicos
+        players = set(p.player for p in props)
+        game_lines.append(
+            f"{i}. *{matchup}*\n"
+            f"   `{slug}`\n"
+            f"   👤 {len(players)} jugadores | 📊 {len(props)//2} líneas\n"
+        )
+
+    footer = (
+        f"{'─'*30}\n"
+        f"_Selecciona un partido:_\n"
+        f"• `/odds BOS` (por equipo)\n"
+        f"• `/odds nba-bos-den-...` (slug completo)\n"
+        f"• O responde con el número del partido (1,2,3...)\n\n"
+        f"_Tiempo de carga: ~30-60 segundos por partido_"
+    )
+
+    menu_text = header + "\n".join(game_lines) + footer
+    
+    # Guardamos los partidos en context.user_data para la selección
+    context.user_data['games_menu'] = list(games_dict.keys())
+    
+    await msg_loading.delete()
+    await update.message.reply_text(menu_text, parse_mode=ParseMode.MARKDOWN)
+
+async def handle_game_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Maneja la selección de partido por número
+    """
+    if not update.message or not update.message.text:
+        return
+    
+    # Verificar si hay un menú activo
+    if 'games_menu' not in context.user_data:
+        return
+    
+    text = update.message.text.strip()
+    if not text.isdigit():
+        return
+    
+    idx = int(text) - 1
+    games = context.user_data['games_menu']
+    
+    if 0 <= idx < len(games):
+        slug = games[idx]
+        props_pm = await asyncio.to_thread(polymarket_props_today_from_scoreboard)
+        game_props = [p for p in props_pm if (p.game_slug or "") == slug]
+        
+        if game_props:
+            await show_game_props(update, context, slug, game_props)
+            # Limpiar el menú después de seleccionar
+            del context.user_data['games_menu']
         else:
-            player_filter = q.lower()
-
-    filtered = props_pm
-    if slug_filter:
-        filtered = [p for p in props_pm if (p.game_slug or "").lower() == slug_filter]
-        if not filtered:
-            slugs_avail = "\n".join(set(f"`{p.game_slug}`" for p in props_pm[:20]))
-            await msg_loading.edit_text(
-                f"❌ Sin props para `{slug_filter}`\n\nDisponibles:\n{slugs_avail}",
+            await update.message.reply_text(
+                f"❌ Error cargando props para {slug}",
                 parse_mode=ParseMode.MARKDOWN
             )
-            return
-    if player_filter:
-        filtered = [p for p in props_pm if player_filter in (p.player or "").lower()]
-        if not filtered:
-            await msg_loading.edit_text(
-                f"❌ Sin props para jugador: `{player_filter}`",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
+    else:
+        await update.message.reply_text(
+            f"❌ Número inválido. Selecciona entre 1 y {len(games)}",
+            parse_mode=ParseMode.MARKDOWN
+        )
 
-    # ── 3. Agrupar props únicos por partido y jugador ──
-    grouped_unique: Dict[str, Dict[str, List[Tuple[str, float, str]]]] = {}
+async def show_game_props(update: Update, context: ContextTypes.DEFAULT_TYPE, slug: str, props: List[Prop]):
+    """
+    Muestra los props de un partido específico
+    """
+    msg_loading = await update.message.reply_text(
+        f"⚡ *Calculando scores para {_slug_to_matchup(slug)}...*\n"
+        f"_(puede tomar hasta 60 segundos)_",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    
+    # ── Agrupar props únicos (solo over para evitar duplicados) ──
+    grouped_unique: Dict[str, List[Tuple[str, float, str]]] = {}
     seen_lines: set = set()
-    for p in filtered:
+    
+    for p in props:
         if p.side != "over":
             continue
-        key = (p.game_slug, p.player, p.tipo, p.line)
+        key = (p.player, p.tipo, p.line)
         if key in seen_lines:
             continue
         seen_lines.add(key)
-        slug = p.game_slug or "unknown"
-        grouped_unique.setdefault(slug, {})
-        grouped_unique[slug].setdefault(p.player, [])
-        grouped_unique[slug][p.player].append((p.tipo, p.line, p.source))
-
-    total_jugadores = sum(len(pls) for pls in grouped_unique.values())
-    total_lineas    = len(seen_lines)
-
-    await msg_loading.edit_text(
-        f"⚡ *Calculando scores...*\n"
-        f"_{total_jugadores} jugadores · {total_lineas} líneas_\n"
-        f"_(los resultados aparecen partido a partido)_",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-    # ── 4. Header global ──
-    today_str = date.today().strftime("%d/%m/%Y")
-    fuentes   = ", ".join(sorted(set(p.source for p in filtered)))
-    header = (
-        f"📋 *NBA Props — {today_str}*\n"
-        f"🔌 {fuentes}  ·  {total_lineas} líneas\n"
-        f"{'─'*30}\n"
-        f"_🔥≥75 · ✅≥60 · 🟡≥45 · 🟠≥30 · ❄️<30_"
-    )
-    await update.message.reply_text(header, parse_mode=ParseMode.MARKDOWN)
-
-    # ── 5. Semáforo: máximo 4 threads simultáneos a NBA API ──
-    sem = asyncio.Semaphore(4)
-
+        grouped_unique.setdefault(p.player, [])
+        grouped_unique[p.player].append((p.tipo, p.line, p.source))
+    
+    # ── Semáforo: máximo 3 threads simultáneos ──
+    sem = asyncio.Semaphore(3)
+    
     async def compute_player_safe(player_name: str, lineas: List[Tuple[str, float, str]]) -> Tuple[str, List[dict]]:
         async with sem:
             results = []
@@ -1324,7 +1395,7 @@ async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     entry = await asyncio.wait_for(
                         asyncio.to_thread(_compute_pre_for_player, player_name, tipo, line, source),
-                        timeout=30.0
+                        timeout=45.0
                     )
                 except asyncio.TimeoutError:
                     log.warning(f"Timeout calculando {player_name} {tipo}")
@@ -1336,57 +1407,49 @@ async def cmd_odds(update: Update, context: ContextTypes.DEFAULT_TYPE):
                              "pre_over": 0, "pre_under": 0, "meta_over": {}, "pid": None}
                 results.append(entry)
             return player_name, results
-
-    # ── 6. Procesar partido a partido ──
-    for slug in sorted(grouped_unique.keys()):
-        matchup = _slug_to_matchup(slug)
-        players_in_game = grouped_unique[slug]
-
-        try:
-            await msg_loading.edit_text(
-                f"⚡ *Calculando...*\n🏀 _{matchup}_ ({len(players_in_game)} jugadores)",
-                parse_mode=ParseMode.MARKDOWN
-            )
-        except Exception:
-            pass
-
-        # Lanzar todos los jugadores del partido con semáforo (máx 4 a la vez)
-        tasks = [compute_player_safe(pl, lineas) for pl, lineas in players_in_game.items()]
-        try:
-            player_results_raw = await asyncio.wait_for(
-                asyncio.gather(*tasks, return_exceptions=True),
-                timeout=120.0
-            )
-        except asyncio.TimeoutError:
-            log.warning(f"Timeout global en partido {slug}")
-            await update.message.reply_text(
-                f"⚠️ *{matchup}* — timeout calculando scores, mostrando sin PRE.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            continue
-
-        # Reconstruir dict player → entries (ignorar excepciones individuales)
-        players_data: Dict[str, List[dict]] = {}
+    
+    # Procesar jugadores
+    tasks = [compute_player_safe(pl, lineas) for pl, lineas in grouped_unique.items()]
+    players_data: Dict[str, List[dict]] = {}
+    
+    try:
+        player_results_raw = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=120.0
+        )
+        
         for result in player_results_raw:
             if isinstance(result, Exception):
                 log.warning(f"Excepción en gather: {result}")
                 continue
             pl_name, entries = result
-            players_data[pl_name] = sorted(entries, key=lambda e: tipo_order.get(e["tipo"], 9))
-
-        if not players_data:
-            continue
-
-        # Construir mensaje y partir si es necesario
-        msg_game = _build_game_message(slug, players_data)
-        await _send_long_message(update, msg_game)
-
-    # ── 7. Borrar loading ──
+            players_data[pl_name] = entries
+    
+    except asyncio.TimeoutError:
+        await msg_loading.edit_text(
+            f"⚠️ Timeout calculando scores.\n"
+            f"Los props se mostrarán sin PRE score.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        # Construir mensaje sin scores
+        lines = [f"🟣 *{_slug_to_matchup(slug)}*\n`{slug}`\n{'─'*28}"]
+        for pl in grouped_unique.keys():
+            lines.append(f"\n👤 *{pl}*")
+            for tipo, line, source in grouped_unique[pl]:
+                lines.append(f"  • {tipo.upper()} `{line}`")
+        
+        full_msg = "\n".join(lines)
+        await _send_long_message(update, full_msg)
+        return
+    
+    # Construir mensaje con scores
+    msg_game = _build_game_message(slug, players_data)
+    await _send_long_message(update, msg_game)
+    
     try:
         await msg_loading.delete()
     except Exception:
         pass
-
 
 async def _send_long_message(update, text: str, max_len: int = 3800):
     """Envía un mensaje partiéndolo en bloques si supera max_len."""
@@ -3742,9 +3805,6 @@ async def cmd_contexto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg_wait.edit_text(full, parse_mode=ParseMode.MARKDOWN)
 
 
-# =========================
-# Main
-# =========================
 # ================================================================
 # SISTEMA MULTI-USUARIO
 # ================================================================
@@ -3937,7 +3997,7 @@ async def cmd_miperfil(update: Update, context: ContextTypes.DEFAULT_TYPE):
 BOT_COMMANDS = [
     BotCommand("start",       "Activar el bot y todos los jobs"),
     BotCommand("games",       "Partidos NBA de hoy"),
-    BotCommand("odds",        "Props con score PRE (todas)"),
+    BotCommand("odds",        "Ver props por partido"),
     BotCommand("alertas",     "Top props recomendadas hoy"),
     BotCommand("live",        "Props en vivo con scoring"),
     BotCommand("lineup",      "Alineaciones + injury report"),
@@ -4030,7 +4090,8 @@ async def register_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ *¡Bienvenido, {uname}!*\n"
         f"Todos los jobs activados.\n\n"
-        f"Toca el 📎 menú o escribe `/` para ver los comandos disponibles.",
+        f"Toca el 📎 menú o escribe `/` para ver los comandos disponibles.\n\n"
+        f"Usa `/odds` para ver los partidos disponibles y seleccionar uno.",
         parse_mode=ParseMode.MARKDOWN
     )
     await cmd_help(update, context)
@@ -4052,9 +4113,12 @@ def main():
     app.add_handler(CommandHandler("help",         guarded(cmd_help)))
     app.add_handler(CommandHandler("games",        guarded(cmd_games)))
     app.add_handler(CommandHandler("today",        guarded(cmd_games)))
-    app.add_handler(CommandHandler("odds",         guarded(cmd_odds)))
+    app.add_handler(CommandHandler("odds",         guarded(cmd_odds)))  # NUEVO
     app.add_handler(CommandHandler("live",         guarded(cmd_live)))
     app.add_handler(CommandHandler("lineup",       guarded(cmd_lineup)))
+
+    # Manejador para selección por número (debe ir ANTES de comandos normales)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_game_selection))
 
     # Análisis
     app.add_handler(CommandHandler("analisis",     guarded(cmd_analisis)))
@@ -4076,76 +4140,6 @@ def main():
     app.add_handler(CommandHandler("usuarios",     cmd_usuarios))
     app.add_handler(CommandHandler("debug",        guarded(cmd_debug)))
     app.add_handler(CommandHandler("add",          guarded(cmd_add)))
-
-    app.post_init = on_startup
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-if __name__ == "__main__":
-    main()
-
-async def register_job(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-
-    # Job 1: scan en vivo (cada POLL_SECONDS)
-    if not context.job_queue.get_jobs_by_name(f"scan:{chat_id}"):
-        context.job_queue.run_repeating(
-            background_scan, interval=POLL_SECONDS, first=5,
-            chat_id=chat_id, name=f"scan:{chat_id}",
-        )
-        await update.message.reply_text(f"✅ Scan en vivo activado (cada {POLL_SECONDS}s).")
-
-    # Job 2: alertas pre-partido (cada 30 min)
-    if not context.job_queue.get_jobs_by_name(f"smart:{chat_id}"):
-        context.job_queue.run_repeating(
-            background_smart_alerts, interval=30*60, first=15,
-            chat_id=chat_id, name=f"smart:{chat_id}",
-        )
-        await update.message.reply_text("✅ Alertas pre-partido activadas.")
-
-    # Job 3: resumen matutino (check cada hora)
-    if not context.job_queue.get_jobs_by_name(f"morning:{chat_id}"):
-        context.job_queue.run_repeating(
-            background_check_morning, interval=60*60, first=30,
-            chat_id=chat_id, name=f"morning:{chat_id}",
-        )
-        await update.message.reply_text(f"✅ Resumen matutino activado (a las {MORNING_DIGEST_HOUR}:00h).")
-
-    # Job 4: auto-resolución de apuestas (cada 20 min)
-    if not context.job_queue.get_jobs_by_name(f"autoresolve:{chat_id}"):
-        context.job_queue.run_repeating(
-            background_autoresolve_bets, interval=20*60, first=60,
-            chat_id=chat_id, name=f"autoresolve:{chat_id}",
-        )
-        await update.message.reply_text("✅ Auto-resolución de apuestas activada.")
-
-    await cmd_help(update, context)
-
-def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    # Principales
-    app.add_handler(CommandHandler("start",        register_job))
-    app.add_handler(CommandHandler("help",         cmd_help))
-    app.add_handler(CommandHandler("games",        cmd_games))
-    app.add_handler(CommandHandler("today",        cmd_games))
-    app.add_handler(CommandHandler("odds",         cmd_odds))
-    app.add_handler(CommandHandler("live",         cmd_live))
-    app.add_handler(CommandHandler("lineup",       cmd_lineup))
-    app.add_handler(CommandHandler("debug",        cmd_debug))
-
-    # Análisis avanzado
-    app.add_handler(CommandHandler("analisis",     cmd_analisis))
-    app.add_handler(CommandHandler("alertas",      cmd_alertas))
-    app.add_handler(CommandHandler("contexto",     cmd_contexto))
-
-    # Tracking de apuestas
-    app.add_handler(CommandHandler("bet",          cmd_bet))
-    app.add_handler(CommandHandler("resultado",    cmd_resultado))
-    app.add_handler(CommandHandler("historial",    cmd_historial))
-    app.add_handler(CommandHandler("misapuestas",  cmd_misapuestas))
-
-    # Manual
-    app.add_handler(CommandHandler("add",          cmd_add))
 
     app.post_init = on_startup
     app.run_polling(allowed_updates=Update.ALL_TYPES)
