@@ -691,10 +691,6 @@ HELP_TEXT = (
     "• `/games` → partidos de hoy\n"
     "• `/live` → props en vivo con scoring\n"
     "• `/lineup` → alineaciones e injury report\n\n"
-    "*📊 Análisis*\n"
-    "• `/analisis Jugador | tipo | side | linea` → tendencia profunda\n"
-    "• `/alertas` → ranking top props del día\n"
-    "• `/contexto AWAY HOME` → defensas y pace\n\n"
     "*💰 Apuestas*\n"
     "• `/bet Jugador | tipo | side | linea | monto`\n"
     "• `/misapuestas`, `/historial`, `/resultado`\n"
@@ -803,7 +799,6 @@ async def show_game_props_advanced(update: Update, context: ContextTypes.DEFAULT
         pid = get_pid_for_name(player)
         if not pid: return player, []
         
-        # Averiguar si es local y el rival
         opp_tricode = home_tri
         is_home = False
         try:
@@ -813,7 +808,7 @@ async def show_game_props_advanced(update: Update, context: ContextTypes.DEFAULT
                 is_home = True
         except: pass
 
-        rest = 1 # simplificado
+        rest = 1 
         results = []
         for (tipo, line) in lines:
             po, meta = pre_score_v2(pid, tipo, line, "over", opp_tricode, is_home, rest)
@@ -821,20 +816,18 @@ async def show_game_props_advanced(update: Update, context: ContextTypes.DEFAULT
             results.append({"tipo": tipo, "line": line, "po": po, "pu": pu, "meta": meta})
         return player, results
 
-    # Ejecutar en paralelo limitando a 3 hilos simultáneos
     sem = asyncio.Semaphore(3)
     async def _safe_calc(player, lines):
         async with sem:
             return await asyncio.wait_for(asyncio.to_thread(_calc_player, player, lines), timeout=25.0)
 
-   tasks = [_safe_calc(pl, ln) for pl, ln in unique_lines.items()]
+    tasks = [_safe_calc(pl, ln) for pl, ln in unique_lines.items()]
     try:
         results = await asyncio.gather(*tasks, return_exceptions=True)
     except Exception as e:
         await msg.edit_text(f"❌ Error de servidor calculando scores: {e}")
         return
 
-    # MANEJO SEGURO DE ERRORES: Extraer solo los datos válidos y saltar los Timeouts
     players_data = {}
     for item in results:
         if isinstance(item, Exception):
@@ -849,7 +842,6 @@ async def show_game_props_advanced(update: Update, context: ContextTypes.DEFAULT
         await msg.edit_text("❌ La API de la NBA está tardando demasiado o bloqueó la IP temporalmente. Por favor, intenta de nuevo en unos minutos.")
         return
 
-    # Formatear el mensaje rico (como en la v2 original)
     tipo_icon = {"puntos": "🏀", "rebotes": "💪", "asistencias": "🎯"}
     tipo_order = {"puntos": 0, "rebotes": 1, "asistencias": 2}
     
@@ -940,8 +932,6 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for pr in matching:
                     actual = pts if pr.tipo == "puntos" else (reb if pr.tipo == "rebotes" else ast)
                     
-                    # Rápido cálculo síncrono porque en vivo to_thread de muchos peta.
-                    # Usamos el cache local del gamelog que se llenó antes o es instantáneo
                     pre_val, meta = await asyncio.to_thread(pre_score, pid, pr.tipo, pr.line, pr.side)
 
                     if pr.side == "over":
@@ -1038,6 +1028,16 @@ async def cmd_lineup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # === COMANDOS APUESTAS ===
+def _parse_bet_command(text: str) -> Optional[dict]:
+    body = re.sub(r"^/bet(@\w+)?\s*", "", text).strip()
+    parts = [x.strip() for x in body.split("|")]
+    if len(parts) < 4: return None
+    player, tipo, side, line_s = parts[0], parts[1].lower(), parts[2].lower(), parts[3]
+    amount_s = parts[4] if len(parts) >= 5 else "1"
+    if tipo not in ("puntos","rebotes","asistencias") or side not in ("over","under"): return None
+    try: return {"player": player, "tipo": tipo, "side": side, "line": float(line_s), "amount": float(amount_s)}
+    except: return None
+
 async def cmd_bet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parsed = _parse_bet_command(update.message.text or "")
     if not parsed:
@@ -1095,12 +1095,9 @@ async def cmd_historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def background_scan(context: ContextTypes.DEFAULT_TYPE):
     cid = context.job.chat_id
     state = await asyncio.to_thread(load_json, ALERTS_STATE_FILE, {})
-    # Esta versión es simplificada en background para no consumir excesivos recursos
-    # pero mantiene vivas las alertas.
     try:
         games = await asyncio.to_thread(lambda: scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"])
-        # Aquí iría el ciclo completo de validación de en vivo
-        pass
+        # Funcionalidad simplificada para no bloquear recursos en background
     except: pass
 
 async def send_morning_digest(context: ContextTypes.DEFAULT_TYPE):
