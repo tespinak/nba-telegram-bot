@@ -260,7 +260,10 @@ CREATE TABLE IF NOT EXISTS signals (
     actual_stat  REAL,
     resolved_at  INTEGER,
     market_id    TEXT,
-    source       TEXT
+    source       TEXT,
+    period       INTEGER,
+    clock        TEXT,
+    score_diff   INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS markets_snapshot (
@@ -296,6 +299,7 @@ CREATE TABLE IF NOT EXISTS daily_risk (
 CREATE INDEX IF NOT EXISTS idx_signals_ts     ON signals(ts);
 CREATE INDEX IF NOT EXISTS idx_signals_player ON signals(player);
 CREATE INDEX IF NOT EXISTS idx_signals_result ON signals(result);
+CREATE INDEX IF NOT EXISTS idx_signals_period ON signals(period);
 """)
 
 conn.commit()
@@ -303,7 +307,7 @@ conn.close()
 log.info(f"DB inicializada: {DB_FILE}")
 ```
 
-def db_save_signal(sig: Signal):
+def db_save_signal(sig: Signal, period: int = 0, clock: str = “”, score_diff: int = 0):
 conn = db_connect()
 try:
 conn.execute(”””
@@ -311,15 +315,15 @@ INSERT OR IGNORE INTO signals
 (signal_id, ts, kind, player, player_id, market, line, side,
 game_slug, implied_prob, model_prob, edge, confidence,
 reason_codes, risk_flags, level, result, actual_stat,
-resolved_at, market_id, source)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+resolved_at, market_id, source, period, clock, score_diff)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 “””, (
 sig.signal_id, sig.ts, sig.kind, sig.player, sig.player_id,
 sig.market, sig.line, sig.side, sig.game_slug,
 sig.implied_prob, sig.model_prob, sig.edge, sig.confidence,
 json.dumps(sig.reason_codes), json.dumps(sig.risk_flags),
 sig.level, sig.result, sig.actual_stat, sig.resolved_at,
-sig.market_id, sig.source
+sig.market_id, sig.source, period, clock, score_diff
 ))
 conn.commit()
 except Exception as e:
@@ -727,91 +731,261 @@ await msg_wait.delete()
 
 async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 “””
-/dashboard - metricas de desempeno: hit rate, edge, ROI por mercado.
+/dashboard [dias] - metricas completas: win rate, edge, CLV, ROI por mercado y por cuarto.
 “””
 args = context.args or []
 days = int(args[0]) if args and args[0].isdigit() else 30
 
 ```
 def _calc():
-    sigs = db_get_signals(days=days)
+    sigs     = db_get_signals(days=days)
     resolved = [s for s in sigs if s.get("result") in ("win","loss","push")]
-    wins   = [s for s in resolved if s["result"] == "win"]
-    losses = [s for s in resolved if s["result"] == "loss"]
+    wins     = [s for s in resolved if s["result"] == "win"]
+    losses   = [s for s in resolved if s["result"] == "loss"]
 
     total_res = len(wins) + len(losses)
     win_rate  = round(len(wins) / total_res * 100, 1) if total_res else 0.0
+    avg_edge  = round(sum(s["edge"] for s in sigs if s.get("edge")) / len(sigs), 2) if sigs else 0.0
+    clv       = round(sum(s["edge"] for s in wins if s.get("edge")) / len(wins), 2) if wins else 0.0
 
-    # Edge promedio de senales enviadas
-    avg_edge = round(sum(s["edge"] for s in sigs if s.get("edge")) / len(sigs), 2) if sigs else 0.0
+    # ROI simple: (wins - losses) / total apuestas * 100
+    roi = round((len(wins) - len(losses)) / total_res * 100, 1) if total_res else 0.0
 
-    # CLV proxy: edge promedio de senales ganadoras
-    clv = round(sum(s["edge"] for s in wins if s.get("edge")) / len(wins), 2) if wins else 0.0
-
-    # Por mercado
+    # Por mercado con ROI individual
     by_market = {}
     for m in ("puntos", "rebotes", "asistencias"):
         m_res = [s for s in resolved if s["market"] == m]
         m_win = sum(1 for s in m_res if s["result"] == "win")
-        by_market[m] = {"w": m_win, "total": len(m_res)}
+        m_loss = sum(1 for s in m_res if s["result"] == "loss")
+        m_roi  = round((m_win - m_loss) / len(m_res) * 100, 1) if m_res else 0.0
+        by_market[m] = {"w": m_win, "l": m_loss, "total": len(m_res), "roi": m_roi}
 
     # Por tipo (pregame/ingame)
     by_kind = {}
     for k in ("pregame", "ingame"):
-        k_res = [s for s in resolved if s["kind"] == k]
-        k_win = sum(1 for s in k_res if s["result"] == "win")
-        by_kind[k] = {"w": k_win, "total": len(k_res)}
+        k_res  = [s for s in resolved if s["kind"] == k]
+        k_win  = sum(1 for s in k_res if s["result"] == "win")
+        k_loss = sum(1 for s in k_res if s["result"] == "loss")
+        k_roi  = round((k_win - k_loss) / len(k_res) * 100, 1) if k_res else 0.0
+        by_kind[k] = {"w": k_win, "l": k_loss, "total": len(k_res), "roi": k_roi}
 
-    # Risk del dia
+    # Por ventana temporal (quarter en que se envio la senal)
+    # Q1=1, Q2=2, Q3=3, Q4=4, 0=pregame
+    by_quarter = {}
+    quarter_labels = {0: "Pre", 1: "Q1", 2: "Q2", 3: "Q3", 4: "Q4+"}
+    for q, label in quarter_labels.items():
+        if q == 0:
+            q_res = [s for s in resolved if (s.get("period") or 0) == 0 or s["kind"] == "pregame"]
+        elif q == 4:
+            q_res = [s for s in resolved if (s.get("period") or 0) >= 4]
+        else:
+            q_res = [s for s in resolved if (s.get("period") or 0) == q]
+        q_win  = sum(1 for s in q_res if s["result"] == "win")
+        q_loss = sum(1 for s in q_res if s["result"] == "loss")
+        q_roi  = round((q_win - q_loss) / len(q_res) * 100, 1) if q_res else 0.0
+        if q_res:  # solo mostrar si hay datos
+            by_quarter[label] = {"w": q_win, "l": q_loss, "total": len(q_res), "roi": q_roi}
+
+    # Edge promedio de senales ENTRY vs WATCH
+    entry_sigs = [s for s in sigs if s.get("level") == "entry"]
+    watch_sigs = [s for s in sigs if s.get("level") == "watch"]
+    entry_wr = round(sum(1 for s in entry_sigs if s.get("result") == "win") /
+                     max(1, sum(1 for s in entry_sigs if s.get("result") in ("win","loss"))) * 100, 1)
+    watch_wr = round(sum(1 for s in watch_sigs if s.get("result") == "win") /
+                     max(1, sum(1 for s in watch_sigs if s.get("result") in ("win","loss"))) * 100, 1)
+
     risk = db_get_daily_risk()
 
     return {
         "total": len(sigs), "resolved": total_res,
         "wins": len(wins), "losses": len(losses),
         "pending": len(sigs) - total_res,
-        "win_rate": win_rate, "avg_edge": avg_edge, "clv": clv,
-        "by_market": by_market, "by_kind": by_kind,
+        "win_rate": win_rate, "avg_edge": avg_edge,
+        "clv": clv, "roi": roi,
+        "by_market": by_market,
+        "by_kind": by_kind,
+        "by_quarter": by_quarter,
+        "entry_wr": entry_wr, "watch_wr": watch_wr,
+        "n_entry": len(entry_sigs), "n_watch": len(watch_sigs),
         "risk": risk,
     }
 
 data = await asyncio.to_thread(_calc)
 
-roi_emoji = "🟢" if data["win_rate"] >= 55 else ("🔴" if data["win_rate"] < 45 else "🟡")
-today_str = date.today().strftime("%d/%m/%Y")
+roi_emoji  = "🟢" if data["roi"] > 5 else ("🔴" if data["roi"] < -5 else "🟡")
+wr_emoji   = "🟢" if data["win_rate"] >= 55 else ("🔴" if data["win_rate"] < 45 else "🟡")
+today_str  = date.today().strftime("%d/%m/%Y")
+tipo_icon  = {"puntos": "🏀", "rebotes": "💪", "asistencias": "🎯"}
 
-tipo_icon = {"puntos":"🏀","rebotes":"💪","asistencias":"🎯"}
-
+# Seccion mercado
 mkt_lines = []
 for m, st in data["by_market"].items():
-    rate = round(st["w"]/st["total"]*100, 1) if st["total"] else 0
-    mkt_lines.append(f"  {tipo_icon.get(m,'*')} {m.capitalize()}: `{st['w']}/{st['total']}` ({rate}%)")
+    if not st["total"]:
+        continue
+    wr = round(st["w"] / st["total"] * 100, 1)
+    roi_s = f"+{st['roi']}%" if st["roi"] >= 0 else f"{st['roi']}%"
+    mkt_lines.append(
+        f"  {tipo_icon.get(m,'*')} {m.capitalize()}: "
+        f"`{st['w']}W/{st['l']}L` ({wr}% WR | ROI {roi_s})"
+    )
 
+# Seccion cuartos
+quarter_lines = []
+for label, st in data["by_quarter"].items():
+    wr = round(st["w"] / st["total"] * 100, 1) if st["total"] else 0
+    roi_s = f"+{st['roi']}%" if st["roi"] >= 0 else f"{st['roi']}%"
+    quarter_lines.append(
+        f"  {label}: `{st['w']}W/{st['l']}L` ({wr}% WR | ROI {roi_s})"
+    )
+
+# Seccion tipo
 kind_lines = []
 for k, st in data["by_kind"].items():
-    rate = round(st["w"]/st["total"]*100, 1) if st["total"] else 0
-    kind_lines.append(f"  {'🕐' if k=='pregame' else '🔴'} {k.capitalize()}: `{st['w']}/{st['total']}` ({rate}%)")
+    if not st["total"]:
+        continue
+    wr = round(st["w"] / st["total"] * 100, 1)
+    roi_s = f"+{st['roi']}%" if st["roi"] >= 0 else f"{st['roi']}%"
+    kind_lines.append(
+        f"  {'🕐' if k == 'pregame' else '🔴 '} {k.capitalize()}: "
+        f"`{st['w']}W/{st['l']}L` ({wr}% WR | ROI {roi_s})"
+    )
 
+roi_global = f"+{data['roi']}%" if data["roi"] >= 0 else f"{data['roi']}%"
 risk = data["risk"]
-risk_bar = f"`{risk['signals_sent']}/{MAX_SIGNALS_DAY}` senales hoy"
 
 msg = (
     f"📊 *DASHBOARD - ultimos {days} dias*\n"
     f"_{today_str}_\n"
     f"{'-'*32}\n\n"
-    f"📝 Total senales: `{data['total']}`\n"
-    f"  ? Win: `{data['wins']}` * ? Loss: `{data['losses']}` * ? Pend: `{data['pending']}`\n\n"
-    f"{roi_emoji} *Win Rate:* `{data['win_rate']}%`\n"
-    f"? *Edge promedio:* `{data['avg_edge']:+.1f}%`\n"
+    f"📝 Senales: `{data['total']}` total "
+    f"(`{data['resolved']}` resueltas | `{data['pending']}` pend)\n\n"
+    f"{wr_emoji} *Win Rate:* `{data['win_rate']}%`\n"
+    f"{roi_emoji} *ROI:* `{roi_global}`\n"
+    f"⚡ *Edge prom:* `{data['avg_edge']:+.1f}%`\n"
     f"💹 *CLV proxy:* `{data['clv']:+.1f}%`\n\n"
+    f"*Nivel de senal:*\n"
+    f"  🟢 ENTRY ({data['n_entry']}): `{data['entry_wr']}%` WR\n"
+    f"  🟡 WATCH ({data['n_watch']}): `{data['watch_wr']}%` WR\n\n"
+)
+
+if mkt_lines:
+    msg += f"{'-'*32}\n*Por mercado:*\n" + "\n".join(mkt_lines) + "\n\n"
+if quarter_lines:
+    msg += f"*Por cuarto (ventana temporal):*\n" + "\n".join(quarter_lines) + "\n\n"
+if kind_lines:
+    msg += f"*Por tipo:*\n" + "\n".join(kind_lines) + "\n\n"
+
+msg += (
     f"{'-'*32}\n"
-    f"*Por mercado:*\n" + "\n".join(mkt_lines) + "\n\n"
-    f"*Por tipo:*\n" + "\n".join(kind_lines) + "\n\n"
-    f"{'-'*32}\n"
-    f"🛡? *Riesgo hoy:* {risk_bar}\n"
-    f"_Usa `/signals` para senales * `/resultado ID WIN stat` para cerrar_"
+    f"🛡 Riesgo hoy: `{risk['signals_sent']}/{MAX_SIGNALS_DAY}` senales\n"
+    f"_/signals para senales * /open para ver pendientes_"
 )
 
 await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+```
+
+async def cmd_open_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+“””
+/open - senales del dia activas (sin resultado aun).
+Permite cerrarlas con /sresult ID WIN|LOSS stat
+“””
+def _get():
+sigs = db_get_signals(days=1)
+return [s for s in sigs if not s.get(“result”)]
+
+```
+pending = await asyncio.to_thread(_get)
+
+if not pending:
+    await update.message.reply_text(
+        "📭 Sin senales pendientes hoy.\n"
+        "_Usa `/signals` para generar senales pregame._",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    return
+
+tipo_icon = {"puntos": "🏀", "rebotes": "💪", "asistencias": "🎯"}
+lines = [f"⏳ *SENALES ABIERTAS HOY* ({len(pending)})\n{'-'*28}"]
+
+for s in sorted(pending, key=lambda x: x["ts"], reverse=True):
+    icon     = tipo_icon.get(s["market"], "*")
+    side_str = "OVER" if s["side"] == "over" else "UNDER"
+    level_e  = "🟢" if s["level"] == "entry" else "🟡"
+    matchup  = _slug_to_matchup(s["game_slug"])
+    edge_str = f"+{s['edge']}%" if s["edge"] >= 0 else f"{s['edge']}%"
+    kind_str = "Pre" if s["kind"] == "pregame" else f"Q{s.get('period','?')}"
+    ts_str   = datetime.fromtimestamp(s["ts"]).strftime("%H:%M")
+
+    lines.append(
+        f"\n{level_e} `#{s['signal_id']}` [{kind_str}] {ts_str}\n"
+        f"👤 *{s['player'].title()}*\n"
+        f"{icon} {s['market'].upper()} {side_str} `{s['line']}` - _{matchup}_\n"
+        f"Edge `{edge_str}` | Conf `{s['confidence']}/100`"
+    )
+
+lines.append(f"\n{'-'*28}\n_Cierra con: `/sresult ID WIN 28.5`_")
+await _send_long_message(update, "\n".join(lines))
+```
+
+async def cmd_sresult(update: Update, context: ContextTypes.DEFAULT_TYPE):
+“””
+/sresult ID WIN|LOSS|PUSH stat_real
+Cierra una senal del sistema (distinto de /resultado que es para apuestas manuales).
+Ej: /sresult A3F2B1C0 WIN 29.5
+“””
+args = context.args or []
+if len(args) < 2:
+await update.message.reply_text(
+“Uso: `/sresult ID WIN|LOSS|PUSH stat`\n”
+“Ej: `/sresult A3F2B1 WIN 29.5`”,
+parse_mode=ParseMode.MARKDOWN
+)
+return
+
+```
+sig_id  = args[0].upper()
+result  = args[1].upper()
+actual  = float(args[2]) if len(args) >= 3 else None
+
+if result not in ("WIN", "LOSS", "PUSH"):
+    await update.message.reply_text("Resultado debe ser WIN, LOSS o PUSH.")
+    return
+
+def _resolve():
+    # Buscar la senal
+    conn = db_connect()
+    row = conn.execute(
+        "SELECT * FROM signals WHERE signal_id=?", (sig_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    sig = dict(row)
+    db_resolve_signal(sig_id, result.lower(), actual or 0)
+    return sig
+
+sig = await asyncio.to_thread(_resolve)
+if not sig:
+    await update.message.reply_text(
+        f"No encontre la senal `{sig_id}`.\n"
+        f"Usa `/open` para ver IDs disponibles.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+    return
+
+emoji = {"WIN": "✅", "LOSS": "❌", "PUSH": "🔁"}.get(result, "?")
+tipo_icon = {"puntos": "🏀", "rebotes": "💪", "asistencias": "🎯"}
+icon = tipo_icon.get(sig["market"], "*")
+actual_str = f" | stat real: `{actual}`" if actual else ""
+
+await update.message.reply_text(
+    f"{emoji} *Senal cerrada* `#{sig_id}`\n"
+    f"👤 {sig['player'].title()}\n"
+    f"{icon} {sig['market'].upper()} {sig['side'].upper()} `{sig['line']}`\n"
+    f"Resultado: *{result}*{actual_str}\n"
+    f"Edge fue: `{sig.get('edge', 0):+.1f}%`",
+    parse_mode=ParseMode.MARKDOWN
+)
 ```
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2617,6 +2791,32 @@ for g in games:
                                 f"🔌 Fuente: {pr.source}\n"
                             )
                             await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.MARKDOWN)
+                            # Guardar senal in-game en DB
+                            try:
+                                sig = Signal(
+                                    signal_id    = _signal_id(name, pr.tipo, pr.line, "over", "ingame"),
+                                    ts           = int(time.time()),
+                                    kind         = "ingame",
+                                    player       = normalize_name(name),
+                                    player_id    = pid,
+                                    market       = pr.tipo,
+                                    line         = pr.line,
+                                    side         = "over",
+                                    game_slug    = pr.game_slug or "",
+                                    implied_prob = round(implied_probability(pre, "over"), 3),
+                                    model_prob   = round(final / 100.0, 3),
+                                    edge         = round((final - pre) / 10.0, 1),
+                                    confidence   = final,
+                                    reason_codes = [f"live_{live}", f"pre_{pre}"],
+                                    risk_flags   = (["foul_risk"] if pf >= 4 else []) + (["blowout"] if is_blowout else []),
+                                    level        = "entry" if final >= FINAL_ALERT_THRESHOLD else "watch",
+                                    market_id    = pr.market_id or "",
+                                    source       = pr.source,
+                                )
+                                db_save_signal(sig, period=period, clock=game_clock, score_diff=diff)
+                                db_increment_risk(normalize_name(name))
+                            except Exception as e:
+                                log.warning(f"Error guardando senal ingame: {e}")
 
                 else:
                     margin_under = float(pr.line) - float(actual)
