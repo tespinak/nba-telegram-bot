@@ -1425,28 +1425,20 @@ async def _send_long_message(update, text: str, max_len: int = 3800):
         await asyncio.sleep(0.3)  # pequeña pausa entre partes
 
 async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg_wait = await update.message.reply_text("⏳ *Cargando datos en vivo...*", parse_mode=ParseMode.MARKDOWN)
+    msg_wait = await update.message.reply_text(
+        "⏳ *Cargando datos en vivo...*", parse_mode=ParseMode.MARKDOWN
+    )
 
-    # Cargar props en thread
-    props_manual = load_props()
-    props_pm = await asyncio.to_thread(polymarket_props_today_from_scoreboard)
-    all_props = (props_manual or []) + (props_pm or [])
-
-    if not all_props:
-        await msg_wait.edit_text(
-            "No tengo props cargados.\n• Intenta `/odds` primero\n• O `/add` para agregar manualmente",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        return
-
-    # Scoreboard en thread
+    # ── 1. Scoreboard (no bloqueante) ──
     try:
         games = await asyncio.wait_for(
-            asyncio.to_thread(lambda: scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"]),
+            asyncio.to_thread(
+                lambda: scoreboard.ScoreBoard().get_dict()["scoreboard"]["games"]
+            ),
             timeout=20.0
         )
     except Exception as e:
-        await msg_wait.edit_text(f"⚠️ Error leyendo scoreboard: {e}")
+        await msg_wait.edit_text(f"⚠️ Error scoreboard: {e}")
         return
 
     live_games = [g for g in games if g.get("gameStatus") == 2]
@@ -1458,24 +1450,48 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await msg_wait.edit_text(
-        f"🔄 *{len(live_games)} partido(s) en vivo* — calculando...",
+        f"🔄 *{len(live_games)} partido(s) en vivo* — leyendo boxscores...",
         parse_mode=ParseMode.MARKDOWN
     )
 
-    # Resolver PIDs en thread (bloqueante)
-    def _resolve_pids():
-        by_pid: Dict[int, List[Prop]] = {}
-        for p in all_props:
-            pid = get_pid_for_name(p.player)
-            if pid:
-                by_pid.setdefault(pid, []).append(p)
-        return by_pid
+    # ── 2. Props del día (desde cache — no hace requests si ya se cargaron) ──
+    props_manual = load_props()
+    props_pm     = PM_CACHE.get("props", [])   # usa cache directamente, SIN request
+    if not props_pm:
+        # Solo si el cache está vacío intentamos cargar (en thread)
+        props_pm = await asyncio.to_thread(polymarket_props_today_from_scoreboard)
+    all_props = (props_manual or []) + (props_pm or [])
 
-    by_pid = await asyncio.to_thread(_resolve_pids)
+    # ── 3. Índice de props por nombre de jugador (sin requests de PIDs) ──
+    # Clave: player_name.lower() → lista de props
+    props_by_name: Dict[str, List[Prop]] = {}
+    for p in all_props:
+        props_by_name.setdefault(p.player.lower(), []).append(p)
+
+    # ── 4. Leer boxscores en paralelo ──
+    async def fetch_box(gid: str):
+        try:
+            return gid, await asyncio.wait_for(
+                asyncio.to_thread(
+                    lambda gid=gid: boxscore.BoxScore(gid).get_dict()["game"]
+                ),
+                timeout=15.0
+            )
+        except Exception as e:
+            log.warning(f"Boxscore error {gid}: {e}")
+            return gid, None
+
+    box_results = await asyncio.gather(*[fetch_box(g["gameId"]) for g in live_games])
+
+    # ── 5. Cruzar boxscore con props por nombre ──
+    # El boxscore tiene nombre del jugador → buscamos en props_by_name
+    # También extraemos el PID del boxscore para pre_score (no necesitamos buscarlo)
     scored_rows = []
 
-    for g in live_games:
-        gid        = g.get("gameId")
+    for g, (gid, box) in zip(live_games, box_results):
+        if not box:
+            continue
+
         status     = g.get("gameStatusText", "")
         period     = int(g.get("period", 0) or 0)
         game_clock = g.get("gameClock", "") or ""
@@ -1485,59 +1501,99 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
         diff       = abs(int(home.get("score", 0)) - int(away.get("score", 0)))
         is_clutch  = diff <= 8
         is_blowout = diff >= BLOWOUT_IS
-        elapsed_min= game_elapsed_minutes(period, clock_sec)
-
-        try:
-            box = await asyncio.wait_for(
-                asyncio.to_thread(lambda gid=gid: boxscore.BoxScore(gid).get_dict()["game"]),
-                timeout=15.0
-            )
-        except Exception:
-            continue
+        elapsed_min = game_elapsed_minutes(period, clock_sec)
 
         for team_key in ["homeTeam", "awayTeam"]:
             for pl in box.get(team_key, {}).get("players", []):
-                pid = pl.get("personId")
-                if pid not in by_pid:
+                # Nombre completo del jugador desde el boxscore
+                first = pl.get("firstName", "") or ""
+                last  = pl.get("familyName", "") or pl.get("lastName", "") or ""
+                full_name = f"{first} {last}".strip().lower()
+                pid_box   = pl.get("personId")
+
+                # Buscar props que coincidan con este jugador por nombre
+                matching_props = props_by_name.get(full_name, [])
+
+                # También intentar con solo apellido (para casos como "Nikola Jokić" vs "Jokic")
+                if not matching_props and last:
+                    for key, plist in props_by_name.items():
+                        if last.lower() in key or key in last.lower():
+                            matching_props = plist
+                            break
+
+                if not matching_props:
                     continue
 
                 s    = pl.get("statistics", {})
-                pts  = s.get("points", 0) or 0
-                reb  = s.get("reboundsTotal", 0) or 0
-                ast  = s.get("assists", 0) or 0
-                pf   = s.get("foulsPersonal", 0) or 0
+                pts  = float(s.get("points", 0) or 0)
+                reb  = float(s.get("reboundsTotal", 0) or 0)
+                ast  = float(s.get("assists", 0) or 0)
+                pf   = float(s.get("foulsPersonal", 0) or 0)
                 mins = parse_minutes(s.get("minutes", ""))
 
-                for pr in by_pid[pid]:
-                    actual   = pts if pr.tipo == "puntos" else (reb if pr.tipo == "rebotes" else ast)
-                    pre, meta = pre_score(pid, pr.tipo, pr.line, pr.side)
+                # pre_score usa el cache si ya fue calculado por /odds
+                # si no, usa el pid del boxscore directamente
+                pid = pid_box
+
+                for pr in matching_props:
+                    actual = pts if pr.tipo == "puntos" else (reb if pr.tipo == "rebotes" else ast)
+
+                    # Usar cache de PRE si existe, sino calcular rápido con pid del boxscore
+                    cache_key_pre = _pre_cache_key(pid, pr.tipo, pr.line)
+                    if cache_key_pre in PRE_SCORE_CACHE:
+                        po, pu, meta = PRE_SCORE_CACHE[cache_key_pre]
+                        pre = po if pr.side == "over" else pu
+                    else:
+                        # Calcular sin llamada HTTP (solo desde gamelog cache)
+                        pre_val, meta = pre_score(pid, pr.tipo, pr.line, pr.side)
+                        pre = pre_val
 
                     if pr.side == "over":
-                        faltante = float(pr.line) - float(actual)
-                        lo_over, hi_over = THRESH_POINTS_OVER if pr.tipo == "puntos" else THRESH_REB_AST_OVER
-                        if not (lo_over <= faltante <= hi_over):
+                        faltante = float(pr.line) - actual
+                        lo, hi = THRESH_POINTS_OVER if pr.tipo == "puntos" else THRESH_REB_AST_OVER
+                        if not (lo <= faltante <= hi):
                             continue
                         if should_gate_by_minutes("over", pr.tipo, faltante, mins, elapsed_min, is_blowout):
                             continue
                         if diff >= BLOWOUT_STRONG:
-                            if (pr.tipo == "puntos" and faltante > 1.0) or (pr.tipo != "puntos" and faltante > 0.8):
+                            if (pr.tipo == "puntos" and faltante > 1.0) or faltante > 0.8:
                                 continue
-                        live  = compute_over_score(pr.tipo, faltante, mins, pf, period, clock_sec, diff, is_clutch, is_blowout)
-                        final = int(clamp(0.55 * live + 0.45 * pre, 0, 100))
-                        scored_rows.append((final, live, pre, pr, actual, faltante, status, period, game_clock, mins, pf, diff, meta))
+                        live_sc = compute_over_score(
+                            pr.tipo, faltante, mins, pf, period, clock_sec,
+                            diff, is_clutch, is_blowout
+                        )
+                        final = int(clamp(0.55 * live_sc + 0.45 * pre, 0, 100))
+                        scored_rows.append((
+                            final, live_sc, pre, pr, actual, faltante,
+                            status, period, game_clock, mins, pf, diff, meta
+                        ))
                     else:
-                        margin_under = float(pr.line) - float(actual)
+                        margin_under = float(pr.line) - actual
                         if should_gate_by_minutes("under", pr.tipo, margin_under, mins, elapsed_min, is_blowout):
                             continue
-                        live  = compute_under_score(pr.tipo, margin_under, mins, pf, period, clock_sec, diff, is_clutch, is_blowout)
-                        final = int(clamp(0.65 * live + 0.35 * pre, 0, 100))
-                        scored_rows.append((final, live, pre, pr, actual, margin_under, status, period, game_clock, mins, pf, diff, meta))
+                        live_sc = compute_under_score(
+                            pr.tipo, margin_under, mins, pf, period, clock_sec,
+                            diff, is_clutch, is_blowout
+                        )
+                        final = int(clamp(0.65 * live_sc + 0.35 * pre, 0, 100))
+                        scored_rows.append((
+                            final, live_sc, pre, pr, actual, margin_under,
+                            status, period, game_clock, mins, pf, diff, meta
+                        ))
 
-    await msg_wait.delete()
+    # ── 6. Mostrar resultados ──
+    try:
+        await msg_wait.delete()
+    except Exception:
+        pass
 
     if not scored_rows:
         await update.message.reply_text(
-            "📭 No hay props cerca de la línea en vivo ahora.\n"
+            "📭 *Sin señal en vivo ahora*\n\n"
+            "Posibles causas:\n"
+            "• Ninguna prop está cerca de su línea\n"
+            "• Los jugadores llevan pocos minutos\n"
+            "• Usa `/odds` primero para cargar el cache de props\n\n"
             "_El bot alertará automáticamente cuando haya señal._",
             parse_mode=ParseMode.MARKDOWN
         )
@@ -1547,20 +1603,22 @@ async def cmd_live(update: Update, context: ContextTypes.DEFAULT_TYPE):
     top = scored_rows[:15]
 
     tipo_icon = {"puntos": "🏀", "rebotes": "💪", "asistencias": "🎯"}
-    out = [f"🔥 *TOP LIVE — {len(live_games)} partido(s)*\n{'─'*28}"]
-    for (final, live, pre, pr, actual, delta, status, period, clock, mins, pf, diff, meta) in top:
+    out = [f"🔥 *LIVE — {len(live_games)} partido(s)*\n{'─'*28}"]
+
+    for (final, live_sc, pre, pr, actual, delta, status, period, clock, mins, pf, diff, meta) in top:
         side_tag = "OVER" if pr.side == "over" else "UNDER"
         extra    = f"faltan `{delta:.1f}`" if pr.side == "over" else f"colchón `{delta:.1f}`"
         icon     = tipo_icon.get(pr.tipo, "•")
+        pre_e    = _pre_rating_emoji(final)
         out.append(
-            f"\n{_pre_rating_emoji(final)} `{final}/100` — *{pr.player}*\n"
-            f"{icon} {pr.tipo.upper()} {side_tag} `{pr.line}` | actual `{actual}` ({extra})\n"
-            f"⏱️ {status} Q{period} {clock} | MIN `{mins:.0f}` PF `{pf}` Dif `{diff}`\n"
-            f"📊 `{meta.get('hits5','?')}/{meta.get('n5','?')}` últ5 | `{meta.get('hits10','?')}/{meta.get('n10','?')}` últ10"
+            f"\n{pre_e} `{final}/100` — *{pr.player}*\n"
+            f"{icon} {pr.tipo.upper()} {side_tag} `{pr.line}` | actual `{actual:.0f}` ({extra})\n"
+            f"⏱️ {status} Q{period} {clock} | MIN `{mins:.0f}` PF `{pf:.0f}` Dif `{diff}`\n"
+            f"📊 `{meta.get('hits5','?')}/{meta.get('n5','?')}` últ5 "
+            f"| `{meta.get('hits10','?')}/{meta.get('n10','?')}` últ10"
         )
 
-    msg = "\n".join(out)
-    await _send_long_message(update, msg)
+    await _send_long_message(update, "\n".join(out))
 
 # =========================
 # Background scan
