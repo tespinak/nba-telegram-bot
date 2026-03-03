@@ -694,10 +694,10 @@ def load_pm_props(snap: Optional[LiveSnapshot]=None) -> List[Prop]:
 
 # Fallback mínimo (actualizar con las props del día)
 _FALLBACK_PROPS: List[Prop] = [
-    Prop("Nikola Jokic","puntos",27.5,"over",source="fallback",game_slug="nba-bos-den-2026-02-27"),
-    Prop("Nikola Jokic","puntos",27.5,"under",source="fallback",game_slug="nba-bos-den-2026-02-27"),
-    Prop("Jaylen Brown","puntos",28.5,"over",source="fallback",game_slug="nba-bos-den-2026-02-27"),
-    Prop("Jaylen Brown","puntos",28.5,"under",source="fallback",game_slug="nba-bos-den-2026-02-27"),
+Prop("Nikola Jokic","puntos",27.5,"over",source="fallback",game_slug=f"nba-den-placeholder-{date.today().isoformat()}"),
+Prop("Nikola Jokic","puntos",27.5,"under",source="fallback",game_slug=f"nba-den-placeholder-{date.today().isoformat()}"),
+Prop("Jaylen Brown","puntos",28.5,"over",source="fallback",game_slug=f"nba-bos-placeholder-{date.today().isoformat()}"),
+Prop("Jaylen Brown","puntos",28.5,"under",source="fallback",game_slug=f"nba-bos-placeholder-{date.today().isoformat()}"),
 ]
 
 # ═══════════════════════════════════════════════════════════════
@@ -981,34 +981,59 @@ async def cmd_live(update:Update, context:ContextTypes.DEFAULT_TYPE):
 
 @guarded
 async def cmd_odds(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    w=await update.message.reply_text("🔍 Cargando props...",parse_mode=ParseMode.MARKDOWN)
-    snap=await get_live_snapshot()
-    props=load_pm_props(snap)
-    args=" ".join(context.args or "").strip().lower()
-    if args.startswith("nba-"): props=[p for p in props if (p.game_slug or "")==args]
-    elif args: props=[p for p in props if args in p.player.lower()]
-    # Solo OVER, dedupe
-    seen=set(); candidates=[]
-    for p in props:
-        if p.side!="over": continue
-        k=(p.game_slug,p.player,p.tipo,p.line)
-        if k not in seen: seen.add(k); candidates.append(p)
-    if not candidates:
-        await w.edit_text("😔 Sin props disponibles."); return
-    await w.edit_text(f"⚙️ Calculando {len(candidates)} props...")
-    sem=asyncio.Semaphore(4)
-    async def _calc(p:Prop):
-        async with sem:
-            def _inner():
-                pid=get_pid(p.player)
-                if not pid: return None
-                slug_parts=(p.game_slug or "").replace("nba-","").split("-")
-                opp=slug_parts[1].upper() if len(slug_parts)>=2 else ""
-                po,pu,meta=pre_cached(pid,p.tipo,p.line,opp)
-                return {"p":p,"po":po,"pu":pu,"meta":meta}
-            try: return await asyncio.wait_for(asyncio.to_thread(_inner),timeout=25)
-            except: return None
-    results=[r for r in await asyncio.gather(*[_calc(p) for p in candidates]) if r]
+	w=await update.message.reply_text("🔍 Cargando props...",parse_mode=ParseMode.MARKDOWN)
+	# 1. Snapshot
+	snap=await get_live_snapshot()
+	# 2. Props con diagnóstico explícito
+	try:
+		props=await asyncio.wait_for(asyncio.to_thread(load_pm_props,snap),timeout=30.0)
+	except asyncio.TimeoutError:
+		await w.edit_text("⏱ Timeout cargando props de Polymarket. Intenta de nuevo."); return
+	except Exception as e:
+		await w.edit_text(f"❌ Error cargando props: {e}"); return
+	args=" ".join(context.args or "").strip().lower()
+	if args.startswith("nba-"): props=[p for p in props if (p.game_slug or "")==args]
+	elif args: props=[p for p in props if args in p.player.lower()]
+	# Solo OVER, dedupe
+	seen=set(); candidates=[]
+	for p in props:
+		if p.side!="over": continue
+		k=(p.game_slug,p.player,p.tipo,p.line)
+		if k not in seen: seen.add(k); candidates.append(p)
+	if not candidates:
+		src="fallback hardcodeado" if props and all(p.source=="fallback" for p in props) else "Polymarket"
+		await w.edit_text(
+			f"😔 *Sin props disponibles* ({len(props)} props de {src}).
+"
+			f"_No hay partidos NBA hoy o Polymarket sin markets activos._",
+			parse_mode=ParseMode.MARKDOWN); return
+	await w.edit_text(f"⚙️ Calculando {len(candidates)} props...")
+	sem=asyncio.Semaphore(4)
+	errors=[]
+	async def _calc(p:Prop):
+		async with sem:
+			def _inner():
+				pid=get_pid(p.player)
+				if not pid: return None
+				slug_parts=(p.game_slug or "").replace("nba-","").split("-")
+				opp=slug_parts[1].upper() if len(slug_parts)>=2 else ""
+				po,pu,meta=pre_cached(pid,p.tipo,p.line,opp)
+				return {"p":p,"po":po,"pu":pu,"meta":meta}
+			try: return await asyncio.wait_for(asyncio.to_thread(_inner),timeout=30)
+			except asyncio.TimeoutError:
+				errors.append(f"timeout:{p.player}"); return None
+			except Exception as e:
+				errors.append(f"{p.player}:{e}"); return None
+	results=[r for r in await asyncio.gather(*[_calc(p) for p in candidates]) if r]
+	if not results:
+		err_preview=", ".join(errors[:5]) if errors else "sin detalles"
+		await w.edit_text(
+			f"❌ *No se pudo calcular ninguna prop.*
+"
+			f"Errores ({len(errors)}): `{err_preview}`
+"
+			f"_Revisa los logs del bot._",
+			parse_mode=ParseMode.MARKDOWN); return
     # Agrupar por slug
     by_slug:Dict[str,List[dict]]={}
     for r in results: by_slug.setdefault(r["p"].game_slug,[]).append(r)
@@ -1516,6 +1541,5 @@ def main():
     for name,fn in handlers: app.add_handler(H(name,fn))
     app.post_init=on_startup
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__=="__main__": main()
