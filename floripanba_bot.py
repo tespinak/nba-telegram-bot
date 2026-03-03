@@ -986,57 +986,62 @@ async def cmd_live(update:Update, context:ContextTypes.DEFAULT_TYPE):
 async def cmd_odds(update:Update, context:ContextTypes.DEFAULT_TYPE):
 	w=await update.message.reply_text("🔍 Cargando props de Polymarket...",parse_mode=ParseMode.MARKDOWN)
 	snap=await get_live_snapshot()
-	# ── Cargar props con timeout y diagnóstico ──
 	try:
 		props=await asyncio.wait_for(asyncio.to_thread(load_pm_props,snap),timeout=35.0)
 	except asyncio.TimeoutError:
-		await w.edit_text("⏱ *Timeout* cargando Polymarket (>35s).\n_Reintenta en un momento._",parse_mode=ParseMode.MARKDOWN); return
+		await w.edit_text("⏱ Timeout cargando Polymarket. Reintentá en un momento."); return
 	except Exception as e:
-		await w.edit_text(f"❌ Error Polymarket: `{e}`",parse_mode=ParseMode.MARKDOWN); return
-	# ── Filtrar por args ──
+		await w.edit_text(f"❌ Error Polymarket: {e}"); return
 	args=" ".join(context.args or "").strip().lower()
 	if args.startswith("nba-"): props=[p for p in props if (p.game_slug or "")==args]
 	elif args: props=[p for p in props if args in p.player.lower()]
-	# ── Solo OVER, dedupe ──
+	# Solo OVER, dedupe por (jugador+tipo+line)
 	seen=set(); candidates=[]
 	for p in props:
 		if p.side!="over": continue
-		k=(p.game_slug,p.player.lower(),p.tipo,p.line)
+		k=(p.player.lower(),p.tipo,p.line)
 		if k not in seen: seen.add(k); candidates.append(p)
 	if not candidates:
-		src_tag="fallback hardcodeado" if props and all(getattr(p,"source","")=="fallback" for p in props) else "Polymarket"
-		await w.edit_text(
-			f"😔 *Sin props disponibles*\n"
-			f"Fuente: {src_tag} · {len(props)} props totales\n"
-			f"_Puede que no haya partidos NBA hoy o Polymarket sin markets activos._",
-			parse_mode=ParseMode.MARKDOWN); return
-	await w.edit_text(f"⚙️ Analizando {len(candidates)} props... (puede tardar ~30s)")
-	# ── Calcular pre-scores en paralelo con semáforo ──
-	sem=asyncio.Semaphore(3)
+		src_tag="fallback" if props and all(getattr(p,"source","")=="fallback" for p in props) else "Polymarket"
+		await w.edit_text(f"😔 Sin props disponibles ({src_tag}, {len(props)} totales)."); return
+	# ── Precalcular PIDs únicos primero (en batch, bloqueante pero rápido) ──
+	uniq_players=list({p.player for p in candidates})
+	await w.edit_text(f"⚙️ Resolviendo {len(uniq_players)} jugadores únicos de {len(candidates)} props...")
+	pid_map: Dict[str,Optional[int]]={}
+	def _resolve_all_pids():
+		for name in uniq_players:
+			pid_map[name]=get_pid(name)
+	try:
+		await asyncio.wait_for(asyncio.to_thread(_resolve_all_pids),timeout=60.0)
+	except asyncio.TimeoutError:
+		await w.edit_text("⏱ Timeout resolviendo PIDs de jugadores. Reintentá."); return
+	valid=[p for p in candidates if pid_map.get(p.player)]
+	if not valid:
+		await w.edit_text(f"❌ No se encontró ningún jugador en la NBA API ({len(candidates)} props)."); return
+	await w.edit_text(f"⚙️ Calculando scores de {len(valid)} props ({len(uniq_players)} jugadores)...")
+	# ── Calcular pre-scores — semáforo 4, timeout por prop ──
+	sem=asyncio.Semaphore(4)
 	errors: List[str]=[]
 	async def _calc(p:Prop):
 		async with sem:
+			pid=pid_map.get(p.player)
+			if not pid: return None
 			def _inner():
-				pid=get_pid(p.player)
-				if not pid: return None
 				slug_parts=(p.game_slug or "").replace("nba-","").split("-")
 				opp=slug_parts[1].upper() if len(slug_parts)>=2 else ""
 				po,pu,meta=pre_cached(pid,p.tipo,p.line,opp)
 				return {"p":p,"po":po,"pu":pu,"meta":meta}
 			try:
-				return await asyncio.wait_for(asyncio.to_thread(_inner),timeout=30)
+				return await asyncio.wait_for(asyncio.to_thread(_inner),timeout=25)
 			except asyncio.TimeoutError:
 				errors.append(f"timeout:{p.player}"); return None
 			except Exception as e:
 				errors.append(f"{p.player}:{type(e).__name__}"); return None
-	results=[r for r in await asyncio.gather(*[_calc(p) for p in candidates]) if r]
+	results=[r for r in await asyncio.gather(*[_calc(p) for p in valid]) if r]
 	if not results:
-		err_str=", ".join(errors[:6]) if errors else "sin detalle"
-		await w.edit_text(
-			f"❌ *No se pudo calcular ninguna prop.*\n"
-			f"Errores ({len(errors)}): `{err_str}`\n"
-			f"_Revisá los logs de Railway._",
-			parse_mode=ParseMode.MARKDOWN); return
+		err_str=", ".join(errors[:5]) if errors else "sin detalle"
+		await w.edit_text(f"❌ Sin resultados. Errores ({len(errors)}): {err_str}
+Revisá los logs de Railway."); return
 
 @guarded
 async def cmd_signals(update:Update, context:ContextTypes.DEFAULT_TYPE):
