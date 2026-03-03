@@ -1040,8 +1040,7 @@ async def cmd_odds(update:Update, context:ContextTypes.DEFAULT_TYPE):
 	results=[r for r in await asyncio.gather(*[_calc(p) for p in valid]) if r]
 	if not results:
 		err_str=", ".join(errors[:5]) if errors else "sin detalle"
-		await w.edit_text(f"❌ Sin resultados. Errores ({len(errors)}): {err_str}
-Revisá los logs de Railway."); return
+		await w.edit_text(f"❌ Sin resultados. Errores ({len(errors)}): {err_str} Revisá los logs de Railway."); return
 
 @guarded
 async def cmd_signals(update:Update, context:ContextTypes.DEFAULT_TYPE):
